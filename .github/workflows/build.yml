@@ -82,6 +82,7 @@ jobs:
         run: pip install . pyinstaller
 
       - name: Build binary
+        shell: bash
         run: |
           pyinstaller \
             --onefile \
