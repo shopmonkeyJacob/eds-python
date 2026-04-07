@@ -70,6 +70,14 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Install unixODBC (macOS)
+        if: runner.os == 'macOS'
+        run: brew install unixodbc
+
+      - name: Install unixODBC (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y unixodbc-dev
+
       - name: Install package and PyInstaller
         run: pip install . pyinstaller
 
