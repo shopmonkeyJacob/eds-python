@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eds"
+version = "0.9.1-rc"
+description = "Shopmonkey Enterprise Data Streaming — Python"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    # NATS / JetStream
+    "nats-py>=2.6.0",
+    # Serialization
+    "msgpack>=1.0.8",
+    # Databases
+    "asyncpg>=0.29",
+    "aiomysql>=0.2.0",
+    "pyodbc>=5.0",
+    "snowflake-connector-python>=3.5",
+    # Cloud storage
+    "boto3>=1.34",
+    "azure-storage-blob>=12.19",
+    # Message queues
+    "confluent-kafka>=2.3",
+    "azure-eventhub>=5.11",
+    # Crypto / PGP
+    "pgpy>=0.6",
+    # Metrics
+    "prometheus-client>=0.18",
+    # System info
+    "psutil>=5.9",
+    # CLI
+    "click>=8.1",
+    # Config / validation
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    # Async file I/O
+    "aiofiles>=23.2",
+    # HTTP
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+eds = "eds.cli.main:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "black>=24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eds*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

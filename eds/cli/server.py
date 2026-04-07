@@ -1,0 +1,427 @@
+"""eds server — main streaming server command."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import signal
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiohttp
+import click
+
+from eds.exit_codes import ExitCodes
+from eds.infrastructure.config import load_config, set_config_value
+from eds.infrastructure.consumer import Consumer, ConsumerConfig_
+from eds.infrastructure.metrics import start_metrics_server
+from eds.infrastructure.notification import NotificationHandlers, NotificationService
+from eds.infrastructure.tracker import SqliteTracker
+from eds.infrastructure.schema_registry import SchemaRegistry
+from eds.infrastructure.upgrade import upgrade, validate_version_string
+from eds.core.driver import new_driver, DriverConfig, DriverMode, get_driver_metadata, _registry
+from eds.version import CURRENT
+
+import eds.drivers  # noqa: F401
+
+_log = logging.getLogger(__name__)
+
+_DEFAULT_API_URL = "https://api.shopmonkey.cloud"
+_RENEW_INTERVAL = 60 * 60 * 24  # 24 hours
+
+
+@click.command()
+@click.option("--api-key", envvar="EDS_TOKEN", default="", help="Shopmonkey API key.")
+@click.option("--api-url", default=_DEFAULT_API_URL, hidden=True)
+@click.option("--url", envvar="EDS_URL", default="", help="Driver connection URL.")
+@click.option("--driver-mode", "driver_mode", default=None,
+              type=click.Choice(["upsert", "timeseries"], case_sensitive=False),
+              help="Event writing mode: upsert (default) or timeseries.")
+@click.option("--events-schema", "events_schema", default=None,
+              help="Schema name for time-series events tables (default: eds_events).")
+@click.option("--renew-interval", default=_RENEW_INTERVAL, hidden=True,
+              help="Session renewal interval in seconds.")
+@click.pass_context
+def server(
+    ctx: click.Context,
+    api_key: str,
+    api_url: str,
+    url: str,
+    driver_mode: str | None,
+    events_schema: str | None,
+    renew_interval: int,
+) -> None:
+    """Start the EDS streaming server."""
+    data_dir: str = ctx.obj["data_dir"]
+    try:
+        asyncio.run(_server(data_dir, api_key, api_url, url, driver_mode, events_schema, renew_interval))
+    except KeyboardInterrupt:
+        pass
+
+
+async def _server(
+    data_dir: str,
+    api_key: str,
+    api_url: str,
+    url: str,
+    driver_mode_flag: str | None,
+    events_schema_flag: str | None,
+    renew_interval: int,
+) -> None:
+    cfg = load_config(data_dir)
+    api_key = api_key or cfg.token
+    api_url = api_url or cfg.api_url
+    url = url or cfg.url
+
+    if not api_key:
+        raise click.ClickException(
+            "API key not found. Run `eds enroll` or set EDS_TOKEN."
+        )
+
+    # Resolve driver mode (flag vs config, persist if changed, prompt on conflict)
+    mode = await _resolve_driver_mode(driver_mode_flag, cfg, data_dir)
+    events_schema = await _resolve_events_schema(events_schema_flag, cfg, data_dir)
+
+    # Start session with HQ
+    session_info = await _start_session(api_url, api_key, cfg.server_id, data_dir)
+    session_id: str = session_info["sessionId"]
+    nats_url: str = session_info["natsUrl"]
+    creds_file: str = session_info["credentialsFile"]
+    company_ids: list[str] = session_info["companyIds"]
+
+    _log.info("Session started: %s", session_id)
+
+    # Tracker
+    tracker = SqliteTracker(Path(data_dir) / "state.db")
+    await tracker.open()
+
+    # Schema registry
+    registry = SchemaRegistry(api_url=api_url, api_key=api_key, tracker=tracker)
+
+    # Driver
+    if not url:
+        _log.warning("No driver URL configured — events will be received but not written")
+        driver = None
+    else:
+        driver_cfg = DriverConfig(
+            url=url,
+            logger=logging.getLogger("driver"),
+            data_dir=data_dir,
+            tracker=tracker,
+            schema_registry=registry,
+            mode=mode,
+            events_schema=events_schema,
+        )
+        driver = await new_driver(url, driver_cfg)
+
+    # Load MVCC timestamps from last import
+    from eds.importer.importer import load_table_export_info
+    export_infos = await load_table_export_info(tracker)
+    export_timestamps = (
+        {info.table: info.timestamp for info in export_infos}
+        if export_infos else None
+    )
+
+    # Metrics server
+    start_metrics_server(host=cfg.metrics.host, port=cfg.metrics.port)
+
+    # Consumer
+    stop_event = asyncio.Event()
+    exit_code = ExitCodes.SUCCESS
+
+    consumer_cfg = ConsumerConfig_(
+        nats_url=nats_url,
+        credentials_file=creds_file,
+        session_id=session_id,
+        server_id=cfg.server_id,
+        company_ids=company_ids,
+        driver=driver,  # type: ignore[arg-type]
+        api_key=api_key,
+        registry=registry,
+        export_table_timestamps=export_timestamps,
+    )
+    consumer = Consumer(consumer_cfg)
+
+    # Notification handlers
+    async def _on_restart() -> None:
+        nonlocal exit_code
+        _log.info("Restart requested by HQ")
+        exit_code = ExitCodes.INTENTIONAL_RESTART
+        stop_event.set()
+
+    async def _on_shutdown(message: str, deleted: bool) -> None:
+        nonlocal exit_code
+        _log.info("Shutdown requested by HQ: %s (deleted=%s)", message, deleted)
+        exit_code = ExitCodes.SUCCESS
+        stop_event.set()
+
+    async def _on_pause() -> None:
+        await consumer.pause()
+
+    async def _on_unpause() -> None:
+        await consumer.unpause()
+
+    async def _on_upgrade(version: str) -> tuple[bool, str | None]:
+        nonlocal exit_code
+        try:
+            validate_version_string(version)
+            from eds.public_key import PUBLIC_KEY
+            binary_url = f"{api_url}/v3/eds/download/{version}/{_platform_suffix()}"
+            sig_url = binary_url + ".sig"
+            destination = str(Path(sys.argv[0]).resolve())
+            await upgrade(binary_url, sig_url, PUBLIC_KEY, destination)
+            exit_code = ExitCodes.INTENTIONAL_RESTART
+            stop_event.set()
+            return True, None
+        except Exception as exc:
+            _log.error("Upgrade failed: %s", exc)
+            return False, str(exc)
+
+    async def _on_configure(driver_url: str, backfill: bool) -> dict:
+        nonlocal url, driver
+        try:
+            await set_config_value(data_dir, "url", driver_url)
+            if driver:
+                await driver.stop()
+            driver_cfg = DriverConfig(
+                url=driver_url,
+                logger=logging.getLogger("driver"),
+                data_dir=data_dir,
+                tracker=tracker,
+                schema_registry=registry,
+                mode=mode,
+                events_schema=events_schema,
+            )
+            driver = await new_driver(driver_url, driver_cfg)
+            url = driver_url
+            exit_code_tmp = ExitCodes.INTENTIONAL_RESTART
+            stop_event.set()
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _driver_config() -> dict:
+        return {"drivers": get_driver_metadata()}
+
+    def _validate(scheme: str, values: dict) -> dict:
+        d = _registry.get(scheme)
+        if not d:
+            return {"success": False, "error": f"Unknown driver: {scheme}"}
+        result_url, errors = d.validate(values)
+        if errors:
+            return {"success": False, "errors": [{"field": e.field, "message": e.message} for e in errors]}
+        return {"success": True, "url": result_url}
+
+    handlers = NotificationHandlers(
+        restart=_on_restart,
+        shutdown=_on_shutdown,
+        pause=_on_pause,
+        unpause=_on_unpause,
+        upgrade=_on_upgrade,
+        configure=_on_configure,
+        driver_config=_driver_config,
+        validate=_validate,
+    )
+
+    notify_svc = NotificationService(
+        nats_url=nats_url,
+        credentials_file=creds_file,
+        session_id=session_id,
+        handlers=handlers,
+    )
+
+    # 24-hour session renewal timer
+    async def _renewal_timer() -> None:
+        nonlocal exit_code
+        await asyncio.sleep(renew_interval)
+        if not stop_event.is_set():
+            _log.info(
+                "[server] Renew interval elapsed (%dh) — stopping for session renewal.",
+                renew_interval // 3600,
+            )
+            exit_code = ExitCodes.INTENTIONAL_RESTART
+            stop_event.set()
+
+    # Handle OS signals
+    loop = asyncio.get_event_loop()
+
+    def _handle_signal() -> None:
+        nonlocal exit_code
+        _log.info("Signal received — shutting down")
+        exit_code = ExitCodes.SUCCESS
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass  # Windows
+
+    # Start everything
+    await consumer.start()
+    await notify_svc.start()
+    renewal_task = asyncio.create_task(_renewal_timer())
+
+    # Watch for NATS disconnect
+    async def _watch_disconnect() -> None:
+        nonlocal exit_code
+        await consumer.disconnected.wait()
+        if not stop_event.is_set():
+            _log.error("NATS disconnected — exiting")
+            exit_code = ExitCodes.NATS_DISCONNECTED
+            stop_event.set()
+
+    disconnect_task = asyncio.create_task(_watch_disconnect())
+
+    _log.info("EDS server v%s running (session=%s, mode=%s)", CURRENT, session_id, mode.value)
+
+    # Wait for shutdown signal
+    await stop_event.wait()
+
+    # Graceful shutdown
+    renewal_task.cancel()
+    disconnect_task.cancel()
+    await asyncio.gather(renewal_task, disconnect_task, return_exceptions=True)
+    await consumer.stop()
+    await notify_svc.stop()
+    if driver:
+        await driver.stop()
+    await tracker.close()
+
+    await _end_session(api_url, api_key, session_id)
+    _log.info("EDS server stopped (exit code %d)", exit_code)
+    sys.exit(exit_code)
+
+
+# ── Driver-mode resolution ────────────────────────────────────────────────────
+
+async def _resolve_driver_mode(
+    flag_value: str | None,
+    cfg: "EdsConfig",  # type: ignore[name-defined]
+    data_dir: str,
+    no_confirm: bool = False,
+) -> DriverMode:
+    """Resolve driver mode: flag vs config, persist to config.toml if changed,
+    prompt interactively on conflict."""
+    from eds.infrastructure.config import EdsConfig  # local import to avoid circulars
+
+    if flag_value is None:
+        return DriverMode(cfg.driver_mode) if cfg.driver_mode else DriverMode.UPSERT
+
+    flag_mode = DriverMode(flag_value.lower())
+    stored = cfg.driver_mode
+
+    if stored and stored != flag_mode.value:
+        if not no_confirm:
+            _log.warning(
+                "[config] Conflict: config.toml has driver_mode=%s but --driver-mode=%s was passed.",
+                stored, flag_mode.value,
+            )
+            confirmed = click.confirm(
+                f"config.toml has driver_mode={stored!r} but you passed "
+                f"--driver-mode={flag_mode.value!r}. Change it?",
+                default=False,
+            )
+            if not confirmed:
+                _log.info("[config] Keeping existing driver_mode=%s.", stored)
+                return DriverMode(stored)
+        _log.info("[config] Updating driver_mode from %s to %s.", stored, flag_mode.value)
+
+    await set_config_value(data_dir, "driver_mode", flag_mode.value)
+    return flag_mode
+
+
+async def _resolve_events_schema(
+    flag_value: str | None,
+    cfg: "EdsConfig",  # type: ignore[name-defined]
+    data_dir: str,
+) -> str:
+    """Resolve events schema: flag vs config, persist to config.toml if changed."""
+    if flag_value is None:
+        return cfg.events_schema or "eds_events"
+    if flag_value != cfg.events_schema:
+        await set_config_value(data_dir, "events_schema", flag_value)
+    return flag_value
+
+
+# ── Session management ─────────────────────────────────────────────────────────
+
+async def _start_session(
+    api_url: str,
+    api_key: str,
+    server_id: str,
+    data_dir: str,
+) -> dict:
+    """Start a new EDS session with Shopmonkey HQ and write the NATS credentials."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": f"Shopmonkey EDS Server/{CURRENT}",
+    }
+    payload = {
+        "serverId": server_id,
+        "version": CURRENT,
+        "os": sys.platform,
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.post(
+            f"{api_url}/v3/eds/internal",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            if not data.get("success"):
+                raise click.ClickException(f"Session start failed: {data.get('message', 'unknown')}")
+            d = data["data"]
+
+    session_id = d["sessionId"]
+    creds_b64: str = d.get("credentials", "")
+    nats_url: str = d.get("natsUrl", "nats://connect.nats.shopmonkey.pub")
+    company_ids: list[str] = d.get("companyIds", ["*"])
+
+    # Write credentials file
+    creds_dir = Path(data_dir) / session_id
+    creds_dir.mkdir(parents=True, exist_ok=True)
+    creds_file = creds_dir / "nats.creds"
+    if creds_b64:
+        import base64
+        creds_file.write_bytes(base64.b64decode(creds_b64))
+        creds_file.chmod(0o600)
+
+    return {
+        "sessionId": session_id,
+        "natsUrl": nats_url,
+        "credentialsFile": str(creds_file) if creds_b64 else "",
+        "companyIds": company_ids,
+    }
+
+
+async def _end_session(api_url: str, api_key: str, session_id: str) -> None:
+    """Notify HQ that this session has ended."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": f"Shopmonkey EDS Server/{CURRENT}",
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            await session.delete(
+                f"{api_url}/v3/eds/internal/{session_id}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+    except Exception as exc:
+        _log.debug("Session end notification failed (non-fatal): %s", exc)
+
+
+def _platform_suffix() -> str:
+    import platform
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "darwin":
+        return "osx-arm64" if "arm" in machine else "osx-x64"
+    if system == "windows":
+        return "win-x64"
+    return "linux-x64"
