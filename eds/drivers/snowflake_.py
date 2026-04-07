@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -160,13 +159,13 @@ class SnowflakeDriver(SqlDriverBase):
         values = [self._coerce_value(cols[c]) for c in columns]
         non_pk = [c for c in columns if c != "id"]
         col_list = ", ".join(f'"{c}"' for c in columns)
-        placeholders = ", ".join(["%s"] * len(columns))
         updates = ", ".join(f'"{c}" = src."{c}"' for c in non_pk)
         src_cols = ", ".join(f'src."{c}"' for c in columns)
+        src_select = ", ".join("%s AS " + f'"{c}"' for c in columns)
 
         sql = (
             f'MERGE INTO "{event.table}" tgt '
-            f"USING (SELECT {', '.join(f'%s AS \"{c}\"' for c in columns)}) src "
+            f"USING (SELECT {src_select}) src "
             f'ON tgt."id" = src."id" '
             f"WHEN MATCHED THEN UPDATE SET {updates} "
             f"WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({src_cols})"

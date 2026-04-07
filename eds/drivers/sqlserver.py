@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -17,7 +16,7 @@ from eds.core.driver import (
     required_string, optional_string, optional_password, optional_number,
     optional_string as opt_str, get_str, get_int,
 )
-from eds.core.models import DbChangeEvent, TableSchema
+from eds.core.models import DbChangeEvent
 from eds.drivers.base import SqlDriverBase
 
 

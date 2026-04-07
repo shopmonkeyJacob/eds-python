@@ -11,7 +11,7 @@ from azure.eventhub import EventData  # type: ignore[import]
 
 from eds.core.driver import (
     DriverField, FieldError,
-    required_string, optional_string, optional_password, get_str,
+    required_string, optional_password, get_str,
     Driver, DriverConfig,
 )
 from eds.core.models import DbChangeEvent

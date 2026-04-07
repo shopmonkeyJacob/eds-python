@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
 import signal
 import sys
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 import click
 
 from eds.exit_codes import ExitCodes
-from eds.infrastructure.config import load_config, set_config_value
+from eds.infrastructure.config import EdsConfig, load_config, set_config_value
 from eds.infrastructure.consumer import Consumer, ConsumerConfig_
 from eds.infrastructure.metrics import start_metrics_server
 from eds.infrastructure.notification import NotificationHandlers, NotificationService
@@ -198,7 +194,6 @@ async def _server(
             )
             driver = await new_driver(driver_url, driver_cfg)
             url = driver_url
-            exit_code_tmp = ExitCodes.INTENTIONAL_RESTART
             stop_event.set()
             return {"success": True}
         except Exception as exc:
@@ -301,14 +296,12 @@ async def _server(
 
 async def _resolve_driver_mode(
     flag_value: str | None,
-    cfg: "EdsConfig",  # type: ignore[name-defined]
+    cfg: EdsConfig,
     data_dir: str,
     no_confirm: bool = False,
 ) -> DriverMode:
     """Resolve driver mode: flag vs config, persist to config.toml if changed,
     prompt interactively on conflict."""
-    from eds.infrastructure.config import EdsConfig  # local import to avoid circulars
-
     if flag_value is None:
         return DriverMode(cfg.driver_mode) if cfg.driver_mode else DriverMode.UPSERT
 
@@ -337,7 +330,7 @@ async def _resolve_driver_mode(
 
 async def _resolve_events_schema(
     flag_value: str | None,
-    cfg: "EdsConfig",  # type: ignore[name-defined]
+    cfg: EdsConfig,
     data_dir: str,
 ) -> str:
     """Resolve events schema: flag vs config, persist to config.toml if changed."""

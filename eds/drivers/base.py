@@ -15,7 +15,7 @@ import logging
 from abc import abstractmethod
 from typing import Any
 
-from eds.core.driver import Driver, DriverConfig, DriverField, FieldError, DriverMode
+from eds.core.driver import Driver, DriverConfig, DriverMode
 from eds.core.models import DbChangeEvent, TableSchema
 
 

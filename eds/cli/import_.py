@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import tempfile
 from pathlib import Path
 
 import click
 
-from eds.infrastructure.config import load_config, set_config_value
+from eds.infrastructure.config import load_config
 from eds.infrastructure.tracker import SqliteTracker
 from eds.infrastructure.schema_registry import SchemaRegistry
-from eds.core.driver import new_driver, DriverConfig, DriverMode
+from eds.core.driver import new_driver, DriverConfig
 from eds.importer.importer import (
     ExportJobRequest,
     ImportCheckpoint,
@@ -24,7 +23,6 @@ from eds.importer.importer import (
     load_checkpoint,
     save_checkpoint,
     save_table_export_info,
-    load_table_export_info,
 )
 
 import eds.drivers  # noqa: F401
@@ -170,7 +168,7 @@ async def _import(
         if not job_id and not Path(import_dir).glob("*.ndjson*"):
             tables = [t.strip() for t in only.split(",") if t.strip()] if only else None
             cids = [c.strip() for c in company_ids.split(",") if c.strip()] if company_ids else None
-            lids = [l.strip() for l in location_ids.split(",") if l.strip()] if location_ids else None
+            lids = [loc.strip() for loc in location_ids.split(",") if loc.strip()] if location_ids else None
             request = ExportJobRequest(tables=tables, company_ids=cids, location_ids=lids)
             job_id = await create_export_job(api_url, api_key, request)
             _log.info("[import] Created export job: %s", job_id)
