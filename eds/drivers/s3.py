@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -107,7 +109,39 @@ class S3Driver(Driver):
         await self._loop.run_in_executor(None, lambda: _upload(events))
 
     async def test(self, url: str) -> None:
-        await self.start(DriverConfig(url=url, logger=__import__("logging").getLogger(__name__),
-                                      data_dir=""))
+        await self.start(DriverConfig(url=url, logger=logging.getLogger(__name__), data_dir=""))
         assert self._loop
         await self._loop.run_in_executor(None, lambda: self._client.head_bucket(Bucket=self._bucket))
+
+    # ── Direct import ──────────────────────────────────────────────────────────
+
+    def supports_direct_import(self) -> bool:
+        return True
+
+    async def direct_import(self, file_table_pairs: list[tuple[str, Path]]) -> None:
+        """Upload raw .ndjson.gz files directly to S3 (up to 8 concurrent)."""
+        sem = asyncio.Semaphore(8)
+        total = len(file_table_pairs)
+
+        async def _upload_one(table: str, path: Path) -> None:
+            prefix_parts = [self._prefix, table]
+            key_prefix = "/".join(p for p in prefix_parts if p)
+            key = f"{key_prefix}/{path.name}"
+
+            def _put() -> None:
+                with open(path, "rb") as f:
+                    self._client.put_object(
+                        Bucket=self._bucket,
+                        Key=key,
+                        Body=f,
+                        ContentType="application/gzip",
+                    )
+
+            async with sem:
+                assert self._loop
+                await self._loop.run_in_executor(None, _put)
+
+        await asyncio.gather(*(_upload_one(t, p) for t, p in file_table_pairs))
+        logging.getLogger(__name__).info(
+            "[import] Uploaded %d file(s) to s3://%s/%s", total, self._bucket, self._prefix
+        )

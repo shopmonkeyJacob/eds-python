@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote as url_quote, urlparse
 
 import aiofiles
 import aiohttp
@@ -152,7 +153,7 @@ async def poll_until_complete(
 
 
 async def _check_job(api_url: str, api_key: str, job_id: str) -> ExportJobResponse:
-    safe_id = job_id.replace("/", "").replace("..", "")
+    safe_id = url_quote(job_id, safe="")
     async with aiohttp.ClientSession(headers=_make_headers(api_key)) as session:
         async with session.get(
             f"{api_url}/v3/export/bulk/{safe_id}",
@@ -184,8 +185,13 @@ async def bulk_download(
     job: ExportJobResponse,
     dest_dir: str,
     checkpoint: ImportCheckpoint | None = None,
-) -> list[TableExportInfo]:
-    """Download all export files into dest_dir with up to 10 concurrent downloads."""
+) -> tuple[list[TableExportInfo], list[tuple[str, Path]]]:
+    """Download all export files into dest_dir with up to 10 concurrent downloads.
+
+    Returns:
+        (table_export_infos, file_table_pairs) where file_table_pairs is a list of
+        (table_name, local_path) tuples suitable for direct-import drivers.
+    """
     os.makedirs(dest_dir, exist_ok=True)
     completed = set(checkpoint.completed_files if checkpoint else [])
 
@@ -209,12 +215,20 @@ async def bulk_download(
     sem = asyncio.Semaphore(10)
     total_bytes = 0
     done_count = 0
+    # Track (table, dest_path) for each completed download
+    file_table_pairs: list[tuple[str, Path]] = []
+    pairs_lock = asyncio.Lock()
 
     async def _download_one(url: str, table: str) -> None:
         nonlocal total_bytes, done_count
+        # Enforce HTTPS-only to prevent SSRF via file:// or other schemes
+        if urlparse(url).scheme not in ("https", "http"):
+            raise ValueError(f"Unsafe download URL scheme: {url}")
         filename = Path(url.split("?")[0]).name
         dest = Path(dest_dir) / filename
         if str(dest) in completed:
+            async with pairs_lock:
+                file_table_pairs.append((table, dest))
             return
 
         # Path containment guard
@@ -236,10 +250,13 @@ async def bulk_download(
             done_count += 1
             _log.debug("[import] Downloaded %d/%d", done_count, len(downloads))
 
+        async with pairs_lock:
+            file_table_pairs.append((table, dest))
+
     await asyncio.gather(*(_download_one(url, table) for url, table in downloads))
     _log.info("[import] Downloaded %d file(s) (%d bytes)", len(downloads), total_bytes)
 
-    return [TableExportInfo(table=t, timestamp=ts) for t, ts in table_ts.items()]
+    return [TableExportInfo(table=t, timestamp=ts) for t, ts in table_ts.items()], file_table_pairs
 
 
 def _parse_timestamp_from_filename(filename: str) -> datetime | None:
@@ -305,6 +322,18 @@ async def import_files(
                 "completedFiles": checkpoint.completed_files,
                 "startedAt": checkpoint.started_at,
             }))
+
+
+async def import_files_direct(
+    driver: Driver,
+    file_table_pairs: list[tuple[str, Path]],
+) -> None:
+    """Pass raw .ndjson.gz files directly to a driver that supports direct import.
+    Skips row-by-row parsing — the driver handles the files natively (e.g. S3 upload, file copy).
+    """
+    _log.info("[import] Using direct import for %d file(s)", len(file_table_pairs))
+    await driver.direct_import(file_table_pairs)
+    _log.info("[import] Direct import complete")
 
 
 # ── Checkpoint helpers ─────────────────────────────────────────────────────────

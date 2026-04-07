@@ -65,18 +65,31 @@ def load_config(data_dir: str) -> EdsConfig:
 
 
 def save_config(data_dir: str, token: str, server_id: str) -> None:
-    """Write a minimal config.toml with restricted permissions (0600)."""
+    """Write a minimal config.toml with restricted permissions (0600).
+
+    Uses os.open() with O_CREAT so the file is never world-readable,
+    even briefly.  There is no write-then-chmod race window.
+    """
     path = Path(data_dir)
     path.mkdir(parents=True, exist_ok=True)
     config_path = path / "config.toml"
     content = f'token     = "{token}"\nserver_id = "{server_id}"\n'
-    config_path.write_text(content)
-    config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                 stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
 
 
 async def set_config_value(data_dir: str, key: str, value: str) -> None:
-    """Update a single key=value in config.toml (upsert)."""
+    """Update a single key=value in config.toml (upsert).
+
+    Writes via a sibling temp file so the existing file's permissions are
+    preserved and there is no window where the file has wrong permissions.
+    """
     config_path = Path(data_dir) / "config.toml"
+    tmp_path = config_path.with_suffix(".toml.tmp")
     lines: list[str] = []
     found = False
     if config_path.exists():
@@ -89,5 +102,11 @@ async def set_config_value(data_dir: str, key: str, value: str) -> None:
                 lines.append(line)
     if not found:
         lines.append(f'{key} = "{value}"')
-    config_path.write_text("\n".join(lines) + "\n")
-    config_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    content = ("\n".join(lines) + "\n").encode()
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                 stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        os.write(fd, content)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, config_path)

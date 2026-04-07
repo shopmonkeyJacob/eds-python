@@ -6,6 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -111,6 +112,17 @@ class Driver(ABC):
         raise NotImplementedError
 
     async def migrate_new_columns(self, schema: TableSchema, columns: list[str]) -> None:  # noqa: ARG002
+        raise NotImplementedError
+
+    def supports_direct_import(self) -> bool:
+        """Return True if this driver can receive raw .ndjson.gz files directly."""
+        return False
+
+    async def direct_import(self, file_table_pairs: list[tuple[str, Path]]) -> None:
+        """Import raw .ndjson.gz files without row-by-row parsing.
+        Only called when supports_direct_import() returns True.
+        file_table_pairs: list of (table_name, local_file_path) tuples.
+        """
         raise NotImplementedError
 
 

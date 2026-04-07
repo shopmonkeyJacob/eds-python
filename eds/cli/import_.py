@@ -23,6 +23,7 @@ from eds.importer.importer import (
     load_checkpoint,
     save_checkpoint,
     save_table_export_info,
+    import_files_direct,
 )
 
 import eds.drivers  # noqa: F401
@@ -182,9 +183,10 @@ async def _import(
             await save_checkpoint(tracker, checkpoint)
 
         # Download
+        file_table_pairs: list = []
         if job_id:
             job = await poll_until_complete(api_url, api_key, job_id)
-            table_infos = await bulk_download(job, import_dir, checkpoint)
+            table_infos, file_table_pairs = await bulk_download(job, import_dir, checkpoint)
             await save_table_export_info(tracker, table_infos)
 
         if not dry_run and not no_confirm and not no_delete:
@@ -203,13 +205,16 @@ async def _import(
             _log.warning("[import] No .ndjson files found in %s", import_dir)
             return
 
-        await import_files(
-            driver=driver,
-            files=files,
-            dry_run=dry_run,
-            tracker=tracker,
-            checkpoint=checkpoint,
-        )
+        if not dry_run and driver.supports_direct_import() and file_table_pairs:
+            await import_files_direct(driver, file_table_pairs)
+        else:
+            await import_files(
+                driver=driver,
+                files=files,
+                dry_run=dry_run,
+                tracker=tracker,
+                checkpoint=checkpoint,
+            )
 
         # Clear checkpoint on success
         await tracker.delete_keys("import:checkpoint", "import:table-export")

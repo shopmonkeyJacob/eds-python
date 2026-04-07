@@ -12,7 +12,7 @@ from eds.core.driver import (
     DriverField, FieldError,
     required_string, optional_string, optional_password, get_str,
 )
-from eds.core.models import DbChangeEvent
+from eds.core.models import DbChangeEvent, TableSchema
 from eds.drivers.base import SqlDriverBase
 
 
@@ -108,6 +108,29 @@ class SnowflakeDriver(SqlDriverBase):
     def _json_extract(self, column: str, field: str) -> str:
         # Snowflake semi-structured: column:field::string
         return f'{column}:"{field}"::string'
+
+    # ── Upsert schema migration ────────────────────────────────────────────────
+
+    def _supports_upsert_migration(self) -> bool:
+        return True
+
+    async def _migrate_new_table_upsert(self, schema: TableSchema) -> None:
+        col_defs = []
+        for col in schema.column_defs():
+            null = "" if col.nullable else " NOT NULL"
+            pk = " PRIMARY KEY" if col.primary_key else ""
+            col_defs.append(f'  "{col.name}" TEXT{null}{pk}')
+        ddl = f'CREATE TABLE IF NOT EXISTS "{schema.table}" (\n' + ",\n".join(col_defs) + "\n)"
+        await self._execute_ddl(ddl)
+
+    async def _migrate_new_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        col_map = {c.name: c for c in schema.column_defs()}
+        for col_name in columns:
+            col = col_map.get(col_name)
+            if col:
+                await self._execute_ddl(
+                    f'ALTER TABLE "{schema.table}" ADD COLUMN IF NOT EXISTS "{col.name}" TEXT'
+                )
 
     # ── DDL / event-insert execution ───────────────────────────────────────────
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
+import os
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -217,6 +220,7 @@ async def _server(
         pause=_on_pause,
         unpause=_on_unpause,
         upgrade=_on_upgrade,
+        send_logs=lambda: _send_logs_to_hq(api_url, api_key, session_id, data_dir),
         configure=_on_configure,
         driver_config=_driver_config,
         validate=_validate,
@@ -378,12 +382,16 @@ async def _start_session(
 
     # Write credentials file
     creds_dir = Path(data_dir) / session_id
-    creds_dir.mkdir(parents=True, exist_ok=True)
+    creds_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     creds_file = creds_dir / "nats.creds"
     if creds_b64:
         import base64
-        creds_file.write_bytes(base64.b64decode(creds_b64))
-        creds_file.chmod(0o600)
+        raw = base64.b64decode(creds_b64)
+        fd = os.open(creds_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, raw)
+        finally:
+            os.close(fd)
 
     return {
         "sessionId": session_id,
@@ -391,6 +399,73 @@ async def _start_session(
         "credentialsFile": str(creds_file) if creds_b64 else "",
         "companyIds": company_ids,
     }
+
+
+async def _send_logs_to_hq(
+    api_url: str,
+    api_key: str,
+    session_id: str,
+    data_dir: str,
+) -> tuple[bool, str | None]:
+    """Upload the most-recent .log file from data_dir to Shopmonkey HQ for remote diagnostics.
+
+    Flow (mirrors .NET SessionService.SendLogsAsync):
+      1. POST /v3/eds/internal/{sessionId}/log  → pre-signed upload URL
+      2. Gzip the log file to a temp path
+      3. PUT the .gz to the pre-signed URL
+    """
+    try:
+        log_files = sorted(
+            Path(data_dir).glob("*.log"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if not log_files:
+            _log.debug("[sendlogs] No log files found in %s", data_dir)
+            return True, None
+
+        log_file = log_files[0]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": f"Shopmonkey EDS Server/{CURRENT}",
+        }
+
+        # Step 1: get a pre-signed upload URL from HQ
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(
+                f"{api_url}/v3/eds/internal/{session_id}/log",
+                json={},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+                body = await resp.json()
+                upload_url: str = body["data"]["url"]
+
+        # Step 2: gzip the log file to a temp path
+        gz_path = Path(data_dir) / (log_file.name + ".gz")
+        try:
+            with log_file.open("rb") as src, gzip.open(gz_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            # Step 3: PUT to the pre-signed URL
+            gz_bytes = gz_path.read_bytes()
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    upload_url,
+                    data=gz_bytes,
+                    headers={"Content-Type": "application/x-tgz"},
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    resp.raise_for_status()
+        finally:
+            gz_path.unlink(missing_ok=True)
+
+        _log.info("[sendlogs] Uploaded %s to HQ.", log_file.name)
+        return True, None
+
+    except Exception as exc:
+        _log.error("[sendlogs] Failed to upload logs to HQ: %s", exc)
+        return False, str(exc)
 
 
 async def _end_session(api_url: str, api_key: str, session_id: str) -> None:

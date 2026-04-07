@@ -6,7 +6,9 @@ Mirrors EDS.Drivers.File — primarily useful for testing and local export.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -87,8 +89,22 @@ class FileDriver(Driver):
         self._pending = []
 
     async def test(self, url: str) -> None:
-        import logging
         await self.start(DriverConfig(url=url, logger=logging.getLogger(__name__), data_dir=""))
         path = Path(self._dir)
         if not path.exists():
             raise FileNotFoundError(f"Directory does not exist: {self._dir}")
+
+    # ── Direct import ──────────────────────────────────────────────────────────
+
+    def supports_direct_import(self) -> bool:
+        return True
+
+    async def direct_import(self, file_table_pairs: list[tuple[str, Path]]) -> None:
+        """Copy raw .ndjson.gz files into per-table subdirectories."""
+        count = 0
+        for table, src in file_table_pairs:
+            dest_dir = Path(self._dir) / table
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest_dir / src.name)
+            count += 1
+        logging.getLogger(__name__).info("[import] Copied %d file(s) to %s", count, self._dir)

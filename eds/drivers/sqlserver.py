@@ -16,7 +16,7 @@ from eds.core.driver import (
     required_string, optional_string, optional_password, optional_number,
     optional_string as opt_str, get_str, get_int,
 )
-from eds.core.models import DbChangeEvent
+from eds.core.models import DbChangeEvent, TableSchema
 from eds.drivers.base import SqlDriverBase
 
 
@@ -195,6 +195,38 @@ class SqlServerDriver(SqlDriverBase):
             self._conn.execute(sql, params)
 
         await self._run(_exec)
+
+    # ── Upsert schema migration ────────────────────────────────────────────────
+
+    def _supports_upsert_migration(self) -> bool:
+        return True
+
+    async def _migrate_new_table_upsert(self, schema: TableSchema) -> None:
+        col_defs = []
+        for col in schema.column_defs():
+            null = "" if col.nullable else " NOT NULL"
+            pk = " PRIMARY KEY" if col.primary_key else ""
+            col_defs.append(f"  {self._quote_id(col.name)} NVARCHAR(MAX){null}{pk}")
+        escaped = schema.table.replace("'", "''")
+        quoted = self._quote_id(schema.table)
+        ddl = (
+            f"IF OBJECT_ID(N'{escaped}', N'U') IS NULL\n"
+            f"BEGIN\n"
+            f"CREATE TABLE {quoted} (\n"
+            + ",\n".join(col_defs) + "\n"
+            + ")\nEND"
+        )
+        await self._execute_ddl(ddl)
+
+    async def _migrate_new_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        col_map = {c.name: c for c in schema.column_defs()}
+        for col_name in columns:
+            col = col_map.get(col_name)
+            if col:
+                await self._execute_ddl(
+                    f"ALTER TABLE {self._quote_id(schema.table)} "
+                    f"ADD {self._quote_id(col.name)} NVARCHAR(MAX) NULL"
+                )
 
     # ── Upsert DML ────────────────────────────────────────────────────────────
 
