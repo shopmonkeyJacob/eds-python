@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import logging
+import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -103,8 +107,58 @@ class EventHubDriver(Driver):
         self._pending = []
 
     async def test(self, url: str) -> None:
-        import logging
         await self.start(DriverConfig(url=url, logger=logging.getLogger(__name__), data_dir=""))
         assert self._producer
         async with self._producer:
             pass  # successful connect is enough
+
+    # ── Direct import ──────────────────────────────────────────────────────────
+
+    def supports_direct_import(self) -> bool:
+        return True
+
+    async def direct_import(self, file_table_pairs: list[tuple[str, Path]]) -> None:
+        """Parse .ndjson.gz files and publish each record as an EventHub message."""
+        log = logging.getLogger(__name__)
+        batch_size = self.max_batch_size()
+        total = 0
+        for table, path in file_table_pairs:
+            log.info("[import] Publishing %s", path.name)
+            count = 0
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rb") as fh:  # type: ignore[call-overload]
+                for raw_line in fh:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        row = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    evt = _build_import_event(row, table, raw_line)
+                    await self.process(evt)
+                    count += 1
+                    if count % batch_size == 0:
+                        await self.flush()
+            if count % batch_size != 0:
+                await self.flush()
+            log.info("[import] %s: %d record(s) published", path.name, count)
+            total += count
+        log.info("[import] Published %d total record(s) to EventHub '%s'", total, self._hub_name)
+
+
+def _build_import_event(row: dict, table: str, raw_line: bytes) -> DbChangeEvent:
+    """Build a synthetic INSERT DbChangeEvent from a raw CRDB export row."""
+    record_id = row.get("id") or str(uuid.uuid4())
+    company_id = row.get("companyId")
+    location_id = row.get("locationId")
+    return DbChangeEvent(
+        operation="INSERT",
+        id=record_id,
+        table=table,
+        key=[record_id],
+        company_id=company_id,
+        location_id=company_id or location_id,
+        after=raw_line,
+        imported=True,
+    )

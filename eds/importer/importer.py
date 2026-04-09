@@ -351,13 +351,20 @@ async def load_checkpoint(tracker: Tracker) -> ImportCheckpoint | None:
     raw = await tracker.get_key(_CHECKPOINT_KEY)
     if raw is None:
         return None
-    d = json.loads(raw)
-    return ImportCheckpoint(
-        job_id=d.get("jobId", ""),
-        download_dir=d.get("downloadDir", ""),
-        completed_files=d.get("completedFiles", []),
-        started_at=d.get("startedAt", ""),
-    )
+    try:
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("checkpoint is not a JSON object")
+        return ImportCheckpoint(
+            job_id=d.get("jobId", ""),
+            download_dir=d.get("downloadDir", ""),
+            completed_files=d.get("completedFiles", []),
+            started_at=d.get("startedAt", ""),
+        )
+    except Exception as exc:
+        _log.warning("[import] Discarding unreadable checkpoint (%s) — starting fresh.", exc)
+        await tracker.delete_keys(_CHECKPOINT_KEY)
+        return None
 
 
 async def save_table_export_info(tracker: Tracker, info: list[TableExportInfo]) -> None:

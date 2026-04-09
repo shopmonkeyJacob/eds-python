@@ -120,11 +120,38 @@ class SqlDriverBase(Driver):
         else:
             await self._migrate_new_columns_upsert(schema, columns)
 
+    async def migrate_changed_columns(self, schema: TableSchema, columns: list[str]) -> None:
+        """Alter the type of columns whose data_type changed in the HQ schema."""
+        if self._mode == DriverMode.TIMESERIES:
+            return  # events table schema is fixed
+        await self._migrate_changed_columns_upsert(schema, columns)
+
+    async def migrate_removed_columns(self, schema: TableSchema, columns: list[str]) -> None:
+        """Drop columns that were removed from the HQ schema."""
+        if self._mode == DriverMode.TIMESERIES:
+            return
+        await self._migrate_removed_columns_upsert(schema, columns)
+
+    async def drop_orphan_tables(self, known_tables: set[str]) -> None:
+        """Drop tables in the DB that are not in *known_tables* (the current HQ schema)."""
+        if self._mode == DriverMode.TIMESERIES:
+            return
+        await self._drop_orphan_tables_upsert(known_tables)
+
     async def _migrate_new_table_upsert(self, schema: TableSchema) -> None:
         raise NotImplementedError
 
     async def _migrate_new_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
         raise NotImplementedError
+
+    async def _migrate_changed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        pass  # default: no-op (override in dialects that support ALTER COLUMN)
+
+    async def _migrate_removed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        pass  # default: no-op (override in dialects that support DROP COLUMN)
+
+    async def _drop_orphan_tables_upsert(self, known_tables: set[str]) -> None:
+        pass  # default: no-op (override in SQL dialects)
 
     # ── Time-series: dialect hook methods ─────────────────────────────────────
     # Defaults match PostgreSQL / generic SQL.  Override per dialect as needed.

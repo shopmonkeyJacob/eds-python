@@ -246,6 +246,7 @@ class Consumer:
 
             force_flush, err = False, None
             try:
+                await self._handle_possible_migration(evt)
                 force_flush = await driver.process(evt)
             except Exception as exc:
                 err = exc
@@ -293,6 +294,68 @@ class Consumer:
         metrics.flush_count.observe(len(self._pending))
         self._pending = []
         self._pending_started = None
+
+    # ── Schema migration (mirrors Go/C# handlePossibleMigration) ─────────────
+
+    async def _handle_possible_migration(self, evt: DbChangeEvent) -> None:
+        """Check whether the event's model version requires a schema migration.
+
+        Raises on any failure so the caller's except block will NAK the event
+        and retry — this is Gap 2: HQ unreachable / schema unavailable → NAK.
+        """
+        registry = self._config.registry
+        driver   = self._config.driver
+        if registry is None or not driver.supports_migration():
+            return
+
+        found, current_version = await registry.get_table_version(evt.table)
+        if found and current_version == (evt.model_version or ""):
+            return  # fast path: version unchanged
+
+        model_version = evt.model_version or ""
+        # Raises if HQ is unreachable — causes NAK via the caller's error handler.
+        new_schema = await registry.get_schema(evt.table, model_version)
+
+        if not found:
+            _log.info("[consumer] Migrating new table: %s v%s", evt.table, model_version)
+            await driver.migrate_new_table(new_schema)
+            await registry.set_table_version(evt.table, model_version)
+            return
+
+        # Version changed — diff old schema vs new
+        try:
+            old_schema = await registry.get_schema(evt.table, current_version)
+        except Exception:
+            old_schema = None
+
+        if old_schema is not None:
+            old_names = {c.name for c in old_schema.column_defs()}
+            new_cols = [c.name for c in new_schema.column_defs() if c.name not in old_names]
+            if new_cols:
+                _log.info("[consumer] Adding %d column(s) to %s: %s",
+                          len(new_cols), evt.table, new_cols)
+                await driver.migrate_new_columns(new_schema, new_cols)
+
+            # Gap 3: detect type changes
+            old_type_map = {c.name: c.data_type for c in old_schema.column_defs()}
+            changed_cols = [
+                c.name for c in new_schema.column_defs()
+                if c.name in old_type_map and old_type_map[c.name] != c.data_type
+            ]
+            if changed_cols:
+                _log.info("[consumer] Changing %d column type(s) on %s: %s",
+                          len(changed_cols), evt.table, changed_cols)
+                await driver.migrate_changed_columns(new_schema, changed_cols)
+
+            # Gap 4: detect removed columns
+            new_names = {c.name for c in new_schema.column_defs()}
+            removed_cols = [c.name for c in old_schema.column_defs() if c.name not in new_names]
+            if removed_cols:
+                _log.info("[consumer] Dropping %d column(s) from %s: %s",
+                          len(removed_cols), evt.table, removed_cols)
+                await driver.migrate_removed_columns(new_schema, removed_cols)
+
+        await registry.set_table_version(evt.table, model_version)
 
     async def _nack_everything(self) -> None:
         for msg, _evt, _ms in self._pending:

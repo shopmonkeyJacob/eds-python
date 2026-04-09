@@ -228,6 +228,43 @@ class SqlServerDriver(SqlDriverBase):
                     f"ADD {self._quote_id(col.name)} NVARCHAR(MAX) NULL"
                 )
 
+    async def _migrate_changed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        for col_name in columns:
+            self._log.info("[sqlserver] Altering column type %s on %s.", col_name, schema.table)
+            await self._execute_ddl(
+                f"ALTER TABLE {self._quote_id(schema.table)} "
+                f"ALTER COLUMN {self._quote_id(col_name)} NVARCHAR(MAX) NULL"
+            )
+
+    async def _migrate_removed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        for col_name in columns:
+            self._log.info("[sqlserver] Dropping removed column %s from %s.", col_name, schema.table)
+            await self._execute_ddl(
+                f"ALTER TABLE {self._quote_id(schema.table)} "
+                f"DROP COLUMN {self._quote_id(col_name)}"
+            )
+
+    async def _drop_orphan_tables_upsert(self, known_tables: set[str]) -> None:
+        assert self._conn
+
+        def _fetch() -> list[str]:
+            assert self._conn
+            cur = self._conn.execute(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE = 'BASE TABLE'"
+            )
+            return [row[0] for row in cur.fetchall()]
+
+        existing = set(await self._run(_fetch))
+        orphans = existing - known_tables
+        for table in orphans:
+            self._log.info("[sqlserver] Dropping orphan table %s.", table)
+            escaped = table.replace("'", "''")
+            await self._execute_ddl(
+                f"IF OBJECT_ID(N'{escaped}', N'U') IS NOT NULL "
+                f"DROP TABLE {self._quote_id(table)}"
+            )
+
     # ── Upsert DML ────────────────────────────────────────────────────────────
 
     async def _execute_upsert(self, event: DbChangeEvent) -> None:

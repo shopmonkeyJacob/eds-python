@@ -187,3 +187,38 @@ class MySQLDriver(SqlDriverBase):
                         await cur.execute(
                             f"ALTER TABLE `{schema.table}` ADD COLUMN IF NOT EXISTS `{col.name}` TEXT"
                         )
+
+    async def _migrate_changed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                for col_name in columns:
+                    self._log.info("[mysql] Altering column type %s on %s.", col_name, schema.table)
+                    await cur.execute(
+                        f"ALTER TABLE `{schema.table}` MODIFY COLUMN `{col_name}` TEXT"
+                    )
+
+    async def _migrate_removed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                for col_name in columns:
+                    self._log.info("[mysql] Dropping removed column %s from %s.", col_name, schema.table)
+                    await cur.execute(
+                        f"ALTER TABLE `{schema.table}` DROP COLUMN `{col_name}`"
+                    )
+
+    async def _drop_orphan_tables_upsert(self, known_tables: set[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'"
+                )
+                rows = await cur.fetchall()
+                existing = {row[0] for row in rows}
+                orphans = existing - known_tables
+                for table in orphans:
+                    self._log.info("[mysql] Dropping orphan table %s.", table)
+                    await cur.execute(f"DROP TABLE IF EXISTS `{table}`")

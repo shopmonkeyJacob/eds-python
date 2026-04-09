@@ -165,3 +165,33 @@ class PostgresDriver(SqlDriverBase):
                     await conn.execute(
                         f'ALTER TABLE "{schema.table}" ADD COLUMN IF NOT EXISTS "{col.name}" TEXT'
                     )
+
+    async def _migrate_changed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            for col_name in columns:
+                self._log.info("[postgres] Altering column type %s on %s.", col_name, schema.table)
+                await conn.execute(
+                    f'ALTER TABLE "{schema.table}" ALTER COLUMN "{col_name}" TYPE TEXT'
+                )
+
+    async def _migrate_removed_columns_upsert(self, schema: TableSchema, columns: list[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            for col_name in columns:
+                self._log.info("[postgres] Dropping removed column %s from %s.", col_name, schema.table)
+                await conn.execute(
+                    f'ALTER TABLE "{schema.table}" DROP COLUMN "{col_name}"'
+                )
+
+    async def _drop_orphan_tables_upsert(self, known_tables: set[str]) -> None:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            )
+            existing = {row["tablename"] for row in rows}
+            orphans = existing - known_tables
+            for table in orphans:
+                self._log.info("[postgres] Dropping orphan table %s.", table)
+                await conn.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')

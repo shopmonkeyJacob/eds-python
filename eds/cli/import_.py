@@ -212,6 +212,31 @@ async def _import(
             _log.warning("[import] No .ndjson files found in %s", import_dir)
             return
 
+        # Gap 5: On a fresh (non-resume) import, drop tables that are in the DB but
+        # no longer in the current HQ schema so the DB ends up fully in sync.
+        if not dry_run and not resume and not no_delete and file_table_pairs:
+            known_tables = {table for table, _ in file_table_pairs}
+            try:
+                await driver.drop_orphan_tables(known_tables)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("[import] Orphan table cleanup skipped: %s", exc)
+
+        # Reconcile DB schema before importing rows: add any columns that appeared
+        # in the HQ schema since the tables were last created or migrated.  This
+        # handles resume imports where the HQ schema has grown new columns that the
+        # destination table doesn't have yet, preventing "Unknown column" errors.
+        if not dry_run and driver.supports_migration() and file_table_pairs:
+            unique_tables = {table for table, _ in file_table_pairs}
+            for table in unique_tables:
+                found, version = await registry.get_table_version(table)
+                if not found or not version:
+                    continue
+                try:
+                    schema = await registry.get_schema(table, version)
+                    await driver.migrate_new_columns(schema, schema.columns())
+                except Exception as exc:  # noqa: BLE001
+                    _log.debug("[import] Schema reconciliation skipped for %s: %s", table, exc)
+
         if not dry_run and driver.supports_direct_import() and file_table_pairs:
             await import_files_direct(driver, file_table_pairs)
         else:

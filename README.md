@@ -13,10 +13,12 @@ A Python port of Shopmonkey's Enterprise Data Streaming server. Connects to Shop
 | `s3`         | Amazon S3                | ✓ ²    |
 | `azureblob`  | Azure Blob Storage       | ✓ ²    |
 | `file`       | Local NDJSON files       | ✓ ²    |
-| `kafka`      | Apache Kafka             |        |
-| `eventhub`   | Azure Event Hubs         |        |
+| `kafka`      | Apache Kafka             | ✓ ³    |
+| `eventhub`   | Azure Event Hubs         | ✓ ³    |
 
 > ² S3, Azure Blob Storage, and File drivers transfer raw `.ndjson.gz` export files directly to the destination, preserving the filename and per-table directory structure. No row-level parsing is performed — the export format is already the natural storage format for these drivers.
+>
+> ³ Kafka and EventHub drivers parse each `.ndjson.gz` export file and publish every row as an individual message to the configured topic/hub, using the same batching and partition-key logic as the live CDC stream.
 
 ## Requirements
 
