@@ -218,13 +218,15 @@ JOIN eds_events.current_customers c ON c.id = wo.customer_id;
 # Start the server in time-series mode
 eds server --driver-mode timeseries
 
-# Run a bulk import into time-series tables
+# Run a bulk import then start the server in time-series mode
 eds import --driver-mode timeseries --url postgres://user:password@localhost/mydb
 ```
 
 The selected mode is automatically persisted to `config.toml` (`driver_mode = "timeseries"`). On subsequent restarts you can omit the flag and the stored value will be used. If you pass `--driver-mode` with a value that differs from what's in `config.toml`, EDS will prompt you to confirm before changing it. Pass `--no-confirm` to accept the change non-interactively (useful in scripts).
 
-> **Note:** Upsert and time-series data can coexist in the same database. The events tables live in the `eds_events` schema (or use a `__events` suffix in MySQL), keeping them separate from any upsert mirror tables.
+> **Note on bulk import:** Regardless of `--driver-mode`, the `eds import` command always writes the snapshot data into the **standard mirror tables** (e.g. `order`, `customer`). The events tables (`eds_events.order_events` etc.) are populated only by the live CDC stream once `eds server` is running. This means you can safely run `eds import --driver-mode timeseries` to set up the mode and load the initial snapshot — the server will then append new change events to the events tables on top of that baseline.
+
+> **Note:** Upsert and time-series data can coexist in the same database. The events tables live in the `eds_events` schema (or use a `__events` suffix in MySQL), keeping them separate from the standard mirror tables.
 
 ## Driver Connection Strings
 

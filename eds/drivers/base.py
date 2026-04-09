@@ -78,15 +78,16 @@ class SqlDriverBase(Driver):
     async def flush(self) -> None:
         if not self._pending:
             return
-        if self._mode == DriverMode.TIMESERIES:
-            for evt in self._pending:
+        for evt in self._pending:
+            # Imported events (bulk import snapshot) always go to the standard mirror
+            # table via upsert, regardless of driver mode. Time-series events tables
+            # are populated by the live CDC stream once the server starts.
+            if self._mode == DriverMode.TIMESERIES and not evt.imported:
                 await self._execute_insert_event(evt)
-        else:
-            for evt in self._pending:
-                if evt.operation == "DELETE":
-                    await self._execute_delete(evt)
-                else:
-                    await self._execute_upsert(evt)
+            elif evt.operation == "DELETE":
+                await self._execute_delete(evt)
+            else:
+                await self._execute_upsert(evt)
         self._pending = []
 
     async def test(self, url: str) -> None:
