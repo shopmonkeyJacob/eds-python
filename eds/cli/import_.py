@@ -156,9 +156,16 @@ async def _import(
         if resume:
             checkpoint = await load_checkpoint(tracker)
             if checkpoint:
+                # Recover job_id from checkpoint so we re-poll the same export
+                # job instead of creating a new one (handles crash during polling).
+                if not job_id:
+                    job_id = checkpoint.job_id
                 import_dir = checkpoint.download_dir
-                _log.info("[import] Resuming from %s (%d files completed)",
-                          import_dir, len(checkpoint.completed_files))
+                # Directory may be missing if the process was killed before
+                # downloading started — recreate it so poll → download can proceed.
+                Path(import_dir).mkdir(parents=True, exist_ok=True)
+                _log.info("[import] Resuming job %s from %s (%d files completed)",
+                          job_id, import_dir, len(checkpoint.completed_files))
 
         cleanup_dir = False
         if not import_dir:
@@ -166,7 +173,7 @@ async def _import(
             cleanup_dir = not no_cleanup
 
         # Export job
-        if not job_id and not Path(import_dir).glob("*.ndjson*"):
+        if not job_id and not list(Path(import_dir).glob("*.ndjson*")):
             tables = [t.strip() for t in only.split(",") if t.strip()] if only else None
             cids = [c.strip() for c in company_ids.split(",") if c.strip()] if company_ids else None
             lids = [loc.strip() for loc in location_ids.split(",") if loc.strip()] if location_ids else None

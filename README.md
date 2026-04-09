@@ -105,19 +105,31 @@ pip install ".[dev]"
 | `--no-delete`     | Insert rows only; do not drop and recreate tables                               |
 | `--schema-only`   | Create tables without importing any rows                                        |
 | `--no-cleanup`    | Keep the temporary download directory after import                              |
-| `--resume`        | Resume the last interrupted import (implies `--no-delete --no-cleanup`)        |
+| `--resume`        | Resume the last interrupted import — re-polls the export if still in progress, skips already-downloaded files, and continues from the first unfinished row file (implies `--no-delete --no-cleanup`) |
 | `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode) |
 | `--events-schema` | Schema name for time-series events tables (default: `eds_events`)              |
 
 #### Import resumability
 
-EDS checkpoints import progress to `data/state.db` after each file completes. If an import is interrupted (crash, Ctrl-C, network failure), rerun with `--resume` to continue from the first unfinished file without re-downloading or re-dropping tables:
+EDS saves a checkpoint to `data/state.db` as soon as an export job is created. This means `--resume` can recover from an interruption at **any stage** of the import pipeline:
+
+| Interrupted during | `--resume` behaviour |
+|--------------------|----------------------|
+| Export polling (HQ still generating files) | Re-polls the same export job until it completes, then downloads |
+| File download | Skips files already on disk, downloads the remainder |
+| Row import | Skips fully-processed files, re-applies the first unfinished file from the start |
 
 ```sh
 eds import --resume
 ```
 
-Because rows are written via upsert, any file that was only partially processed when the interruption occurred is safely re-applied from the start. The checkpoint is automatically cleared after a successful full import.
+Because rows are written via upsert, re-applying a partially-processed file is safe — duplicate rows are simply overwritten. The checkpoint is automatically cleared after a successful full import.
+
+You can also specify an export job ID explicitly to attach to a known job without needing a saved checkpoint:
+
+```sh
+eds import --job-id <export-job-id>
+```
 
 ## Time-Series Mode
 
