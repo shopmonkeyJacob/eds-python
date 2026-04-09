@@ -85,174 +85,22 @@ async def _server(
     mode = await _resolve_driver_mode(driver_mode_flag, cfg, data_dir)
     events_schema = await _resolve_events_schema(events_schema_flag, cfg, data_dir)
 
-    # Start session with HQ
-    session_info = await _start_session(api_url, api_key, cfg.server_id, data_dir)
-    session_id: str = session_info["sessionId"]
-    nats_url: str = session_info["natsUrl"]
-    creds_file: str = session_info["credentialsFile"]
-    company_ids: list[str] = session_info["companyIds"]
-
-    _log.info("Session started: %s", session_id)
-
-    # Tracker
+    # ── One-time setup (shared across session renewals) ───────────────────────
     tracker = SqliteTracker(Path(data_dir) / "state.db")
     await tracker.open()
 
-    # Schema registry
-    registry = SchemaRegistry(api_url=api_url, api_key=api_key, tracker=tracker)
-
-    # Driver
-    if not url:
-        _log.warning("No driver URL configured — events will be received but not written")
-        driver = None
-    else:
-        driver_cfg = DriverConfig(
-            url=url,
-            logger=logging.getLogger("driver"),
-            data_dir=data_dir,
-            tracker=tracker,
-            schema_registry=registry,
-            mode=mode,
-            events_schema=events_schema,
-        )
-        driver = await new_driver(url, driver_cfg)
-
-    # Load MVCC timestamps from last import
-    from eds.importer.importer import load_table_export_info
-    export_infos = await load_table_export_info(tracker)
-    export_timestamps = (
-        {info.table: info.timestamp for info in export_infos}
-        if export_infos else None
-    )
-
-    # Metrics server
     start_metrics_server(host=cfg.metrics.host, port=cfg.metrics.port)
 
-    # Consumer
-    stop_event = asyncio.Event()
-    exit_code = ExitCodes.SUCCESS
-
-    consumer_cfg = ConsumerConfig_(
-        nats_url=nats_url,
-        credentials_file=creds_file,
-        session_id=session_id,
-        server_id=cfg.server_id,
-        company_ids=company_ids,
-        driver=driver,  # type: ignore[arg-type]
-        api_key=api_key,
-        registry=registry,
-        export_table_timestamps=export_timestamps,
-    )
-    consumer = Consumer(consumer_cfg)
-
-    # Notification handlers
-    async def _on_restart() -> None:
-        nonlocal exit_code
-        _log.info("Restart requested by HQ")
-        exit_code = ExitCodes.INTENTIONAL_RESTART
-        stop_event.set()
-
-    async def _on_shutdown(message: str, deleted: bool) -> None:
-        nonlocal exit_code
-        _log.info("Shutdown requested by HQ: %s (deleted=%s)", message, deleted)
-        exit_code = ExitCodes.SUCCESS
-        stop_event.set()
-
-    async def _on_pause() -> None:
-        await consumer.pause()
-
-    async def _on_unpause() -> None:
-        await consumer.unpause()
-
-    async def _on_upgrade(version: str) -> tuple[bool, str | None]:
-        nonlocal exit_code
-        try:
-            validate_version_string(version)
-            from eds.public_key import PUBLIC_KEY
-            binary_url = f"{api_url}/v3/eds/download/{version}/{_platform_suffix()}"
-            sig_url = binary_url + ".sig"
-            destination = str(Path(sys.argv[0]).resolve())
-            await upgrade(binary_url, sig_url, PUBLIC_KEY, destination)
-            exit_code = ExitCodes.INTENTIONAL_RESTART
-            stop_event.set()
-            return True, None
-        except Exception as exc:
-            _log.error("Upgrade failed: %s", exc)
-            return False, str(exc)
-
-    async def _on_configure(driver_url: str, backfill: bool) -> dict:
-        nonlocal url, driver
-        try:
-            await set_config_value(data_dir, "url", driver_url)
-            if driver:
-                await driver.stop()
-            driver_cfg = DriverConfig(
-                url=driver_url,
-                logger=logging.getLogger("driver"),
-                data_dir=data_dir,
-                tracker=tracker,
-                schema_registry=registry,
-                mode=mode,
-                events_schema=events_schema,
-            )
-            driver = await new_driver(driver_url, driver_cfg)
-            url = driver_url
-            stop_event.set()
-            return {"success": True}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-    def _driver_config() -> dict:
-        return {"drivers": get_driver_metadata()}
-
-    def _validate(scheme: str, values: dict) -> dict:
-        d = _registry.get(scheme)
-        if not d:
-            return {"success": False, "error": f"Unknown driver: {scheme}"}
-        result_url, errors = d.validate(values)
-        if errors:
-            return {"success": False, "errors": [{"field": e.field, "message": e.message} for e in errors]}
-        return {"success": True, "url": result_url}
-
-    handlers = NotificationHandlers(
-        restart=_on_restart,
-        shutdown=_on_shutdown,
-        pause=_on_pause,
-        unpause=_on_unpause,
-        upgrade=_on_upgrade,
-        send_logs=lambda: _send_logs_to_hq(api_url, api_key, session_id, data_dir),
-        configure=_on_configure,
-        driver_config=_driver_config,
-        validate=_validate,
-    )
-
-    notify_svc = NotificationService(
-        nats_url=nats_url,
-        credentials_file=creds_file,
-        session_id=session_id,
-        handlers=handlers,
-    )
-
-    # 24-hour session renewal timer
-    async def _renewal_timer() -> None:
-        nonlocal exit_code
-        await asyncio.sleep(renew_interval)
-        if not stop_event.is_set():
-            _log.info(
-                "[server] Renew interval elapsed (%dh) — stopping for session renewal.",
-                renew_interval // 3600,
-            )
-            exit_code = ExitCodes.INTENTIONAL_RESTART
-            stop_event.set()
-
-    # Handle OS signals
+    # OS signal handler: sets a global stop event so the restart loop exits cleanly.
     loop = asyncio.get_event_loop()
+    global_stop = asyncio.Event()
+    exit_code = ExitCodes.SUCCESS
 
     def _handle_signal() -> None:
         nonlocal exit_code
         _log.info("Signal received — shutting down")
         exit_code = ExitCodes.SUCCESS
-        stop_event.set()
+        global_stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -260,38 +108,229 @@ async def _server(
         except NotImplementedError:
             pass  # Windows
 
-    # Start everything
-    await consumer.start()
-    await notify_svc.start()
-    renewal_task = asyncio.create_task(_renewal_timer())
+    # ── Session restart loop ──────────────────────────────────────────────────
+    # Each iteration is one HQ session. On INTENTIONAL_RESTART (renewal timer or
+    # HQ restart notification) the session ends and a new one begins in-process.
+    # Upgrade sets exit_process=True so the loop breaks after session end,
+    # allowing the replacement binary to be executed.
+    try:
+        while not global_stop.is_set():
+            # Start session with HQ
+            session_info = await _start_session(api_url, api_key, cfg.server_id, data_dir)
+            session_id: str = session_info["sessionId"]
+            nats_url: str = session_info["natsUrl"]
+            creds_file: str = session_info["credentialsFile"]
+            company_ids: list[str] = session_info["companyIds"]
 
-    # Watch for NATS disconnect
-    async def _watch_disconnect() -> None:
-        nonlocal exit_code
-        await consumer.disconnected.wait()
-        if not stop_event.is_set():
-            _log.error("NATS disconnected — exiting")
-            exit_code = ExitCodes.NATS_DISCONNECTED
-            stop_event.set()
+            _log.info("Session started: %s", session_id)
 
-    disconnect_task = asyncio.create_task(_watch_disconnect())
+            # Per-session resources
+            registry = SchemaRegistry(api_url=api_url, api_key=api_key, tracker=tracker)
 
-    _log.info("EDS server v%s running (session=%s, mode=%s)", CURRENT, session_id, mode.value)
+            driver = None
+            if url:
+                driver_cfg = DriverConfig(
+                    url=url,
+                    logger=logging.getLogger("driver"),
+                    data_dir=data_dir,
+                    tracker=tracker,
+                    schema_registry=registry,
+                    mode=mode,
+                    events_schema=events_schema,
+                )
+                driver = await new_driver(url, driver_cfg)
+            else:
+                _log.warning("No driver URL configured — events will be received but not written")
 
-    # Wait for shutdown signal
-    await stop_event.wait()
+            # Load MVCC timestamps from last import
+            from eds.importer.importer import load_table_export_info
+            export_infos = await load_table_export_info(tracker)
+            export_timestamps = (
+                {info.table: info.timestamp for info in export_infos}
+                if export_infos else None
+            )
 
-    # Graceful shutdown
-    renewal_task.cancel()
-    disconnect_task.cancel()
-    await asyncio.gather(renewal_task, disconnect_task, return_exceptions=True)
-    await consumer.stop()
-    await notify_svc.stop()
-    if driver:
-        await driver.stop()
-    await tracker.close()
+            stop_event = asyncio.Event()
+            session_exit_code = ExitCodes.SUCCESS
+            exit_process = False
 
-    await _end_session(api_url, api_key, session_id)
+            consumer_cfg = ConsumerConfig_(
+                nats_url=nats_url,
+                credentials_file=creds_file,
+                session_id=session_id,
+                server_id=cfg.server_id,
+                company_ids=company_ids,
+                driver=driver,  # type: ignore[arg-type]
+                api_key=api_key,
+                registry=registry,
+                export_table_timestamps=export_timestamps,
+            )
+            consumer = Consumer(consumer_cfg)
+
+            # ── Notification handlers ─────────────────────────────────────────
+
+            async def _on_restart() -> None:
+                nonlocal session_exit_code
+                _log.info("[server] Restart requested by HQ — renewing session.")
+                session_exit_code = ExitCodes.INTENTIONAL_RESTART
+                stop_event.set()
+
+            async def _on_shutdown(message: str, deleted: bool) -> None:
+                nonlocal session_exit_code
+                if deleted:
+                    _log.warning("[server] Server removed from HQ: %s", message)
+                else:
+                    _log.info("[server] Shutdown requested by HQ: %s", message)
+                session_exit_code = ExitCodes.SUCCESS
+                stop_event.set()
+
+            async def _on_pause() -> None:
+                await consumer.pause()
+
+            async def _on_unpause() -> None:
+                await consumer.unpause()
+
+            async def _on_upgrade(version: str) -> tuple[bool, str | None]:
+                nonlocal session_exit_code, exit_process
+                try:
+                    validate_version_string(version)
+                    from eds.public_key import PUBLIC_KEY
+                    binary_url = f"{api_url}/v3/eds/download/{version}/{_platform_suffix()}"
+                    sig_url = binary_url + ".sig"
+                    destination = str(Path(sys.argv[0]).resolve())
+                    await upgrade(binary_url, sig_url, PUBLIC_KEY, destination)
+                    # exitProcess=True so the loop exits after session end,
+                    # allowing the process manager to relaunch the new binary.
+                    exit_process = True
+                    session_exit_code = ExitCodes.INTENTIONAL_RESTART
+                    stop_event.set()
+                    return True, None
+                except Exception as exc:
+                    _log.error("Upgrade failed: %s", exc)
+                    return False, str(exc)
+
+            async def _on_configure(driver_url: str, backfill: bool) -> dict:
+                nonlocal url, driver
+                try:
+                    await set_config_value(data_dir, "url", driver_url)
+                    if driver:
+                        await driver.stop()
+                    new_driver_cfg = DriverConfig(
+                        url=driver_url,
+                        logger=logging.getLogger("driver"),
+                        data_dir=data_dir,
+                        tracker=tracker,
+                        schema_registry=registry,
+                        mode=mode,
+                        events_schema=events_schema,
+                    )
+                    driver = await new_driver(driver_url, new_driver_cfg)
+                    url = driver_url
+                    stop_event.set()
+                    return {"success": True}
+                except Exception as exc:
+                    return {"success": False, "error": str(exc)}
+
+            def _driver_config() -> dict:
+                return {"drivers": get_driver_metadata()}
+
+            def _validate(scheme: str, values: dict) -> dict:
+                d = _registry.get(scheme)
+                if not d:
+                    return {"success": False, "error": f"Unknown driver: {scheme}"}
+                result_url, errors = d.validate(values)
+                if errors:
+                    return {"success": False, "errors": [{"field": e.field, "message": e.message} for e in errors]}
+                return {"success": True, "url": result_url}
+
+            handlers = NotificationHandlers(
+                restart=_on_restart,
+                shutdown=_on_shutdown,
+                pause=_on_pause,
+                unpause=_on_unpause,
+                upgrade=_on_upgrade,
+                send_logs=lambda: _send_logs_to_hq(api_url, api_key, session_id, data_dir),
+                configure=_on_configure,
+                driver_config=_driver_config,
+                validate=_validate,
+            )
+
+            notify_svc = NotificationService(
+                nats_url=nats_url,
+                credentials_file=creds_file,
+                session_id=session_id,
+                handlers=handlers,
+            )
+
+            # ── Per-session background tasks ──────────────────────────────────
+
+            async def _renewal_timer() -> None:
+                nonlocal session_exit_code
+                await asyncio.sleep(renew_interval)
+                if not stop_event.is_set():
+                    _log.info(
+                        "[server] Renew interval elapsed (%dh) — renewing session.",
+                        renew_interval // 3600,
+                    )
+                    session_exit_code = ExitCodes.INTENTIONAL_RESTART
+                    stop_event.set()
+
+            async def _watch_disconnect() -> None:
+                nonlocal session_exit_code
+                await consumer.disconnected.wait()
+                if not stop_event.is_set():
+                    _log.error("NATS disconnected — exiting")
+                    session_exit_code = ExitCodes.NATS_DISCONNECTED
+                    stop_event.set()
+
+            async def _watch_global_stop() -> None:
+                await global_stop.wait()
+                stop_event.set()
+
+            # Start session services
+            await consumer.start()
+            await notify_svc.start()
+            renewal_task = asyncio.create_task(_renewal_timer())
+            disconnect_task = asyncio.create_task(_watch_disconnect())
+            global_stop_task = asyncio.create_task(_watch_global_stop())
+
+            _log.info("EDS server v%s running (session=%s, mode=%s)", CURRENT, session_id, mode.value)
+
+            # Wait for any stop signal
+            await stop_event.wait()
+
+            # Graceful shutdown of per-session tasks
+            renewal_task.cancel()
+            disconnect_task.cancel()
+            global_stop_task.cancel()
+            await asyncio.gather(renewal_task, disconnect_task, global_stop_task, return_exceptions=True)
+
+            await consumer.stop()
+            await notify_svc.stop()
+            if driver:
+                await driver.stop()
+
+            await _send_logs_to_hq(api_url, api_key, session_id, data_dir)
+            await _end_session(api_url, api_key, session_id)
+            _log.info("[server] session ended: %s", session_id)
+
+            exit_code = session_exit_code
+
+            # ── Decide: renew session or exit ─────────────────────────────────
+            if global_stop.is_set() or exit_process:
+                break
+
+            if exit_code == ExitCodes.INTENTIONAL_RESTART:
+                _log.info("[server] Restarting with fresh session...")
+                exit_code = ExitCodes.SUCCESS
+                continue
+
+            # Any other exit code (success, fatal) — stop.
+            break
+
+    finally:
+        await tracker.close()
+
     _log.info("EDS server stopped (exit code %d)", exit_code)
     sys.exit(exit_code)
 
