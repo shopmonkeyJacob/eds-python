@@ -114,9 +114,10 @@ class SqlDriverBase(Driver):
 
     async def migrate_new_columns(self, schema: TableSchema, columns: list[str]) -> None:
         if self._mode == DriverMode.TIMESERIES:
-            # Events table schema is fixed — just refresh both views.
+            # Events table schema is fixed — just refresh all three views.
             await self._execute_ddl(self._build_current_view_sql(schema.table))
             await self._execute_ddl(self._build_history_view_sql(schema.table, schema))
+            await self._try_create_unified_view(schema.table, schema)
         else:
             await self._migrate_new_columns_upsert(schema, columns)
 
@@ -242,14 +243,84 @@ class SqlDriverBase(Driver):
         )
         return self._build_create_or_replace_view_sql(qv, select_sql)
 
+    def _build_unified_view_sql(self, table: str, schema: TableSchema) -> str:
+        """
+        Builds a unified view that merges the CDC event stream with the standard mirror table.
+        Records that have CDC events use the event-derived state (authoritative).
+        Records that exist only in the mirror table (e.g. pre-import backfill not yet touched
+        by CDC) are included from the mirror table directly so the full dataset is visible.
+        The view is named ``{table}_unified`` in the events schema.
+        Returns an empty string when the schema has no columns.
+        """
+        cols = [c.name for c in schema.column_defs()]
+        if not cols:
+            return ""
+
+        qt = self._qualify_events_table(table)
+        mirror_table = self._quote_id(table)
+        qv = self._qualify_events_view(f"{table}_unified")
+
+        # _entity_id stores Key[-1] — the single entity identifier string (last CRDB key
+        # segment). For all Shopmonkey tables this is the "id" column.
+        pk_cols = [c.name for c in schema.column_defs() if c.primary_key]
+        entity_id_col = pk_cols[0] if pk_cols else "id"
+
+        # Events side: project each data column out of the JSON payload.
+        event_projections = ",\n".join(
+            f"  COALESCE({self._json_extract('_after', col)}, "
+            f"{self._json_extract('_before', col)}) AS {self._quote_id(col)}"
+            for col in cols
+        )
+        # Mirror-table side: select columns directly (aliased to avoid ambiguity).
+        mirror_projections = ",\n".join(
+            f"  s.{self._quote_id(col)}"
+            for col in cols
+        )
+
+        select_sql = (
+            f"SELECT\n{event_projections}\n"
+            f"FROM (\n"
+            f"  SELECT *,\n"
+            f"    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn\n"
+            f"  FROM {qt}\n"
+            f") ranked\n"
+            f"WHERE rn = 1 AND _operation <> 'DELETE'\n"
+            f"\nUNION ALL\n\n"
+            f"SELECT\n{mirror_projections}\n"
+            f"FROM {mirror_table} s\n"
+            f"WHERE NOT EXISTS (\n"
+            f"  SELECT 1 FROM {qt} e\n"
+            f"  WHERE e._entity_id = s.{self._quote_id(entity_id_col)}\n"
+            f")"
+        )
+        return self._build_create_or_replace_view_sql(qv, select_sql)
+
+    async def _try_create_unified_view(self, table: str, schema: TableSchema) -> None:
+        """Attempt to create/replace the unified view; silently skip if the mirror table
+        does not yet exist (e.g. server has only run in time-series mode with no prior import)."""
+        unified_sql = self._build_unified_view_sql(table, schema)
+        if not unified_sql:
+            return
+        try:
+            await self._execute_ddl(unified_sql)
+        except Exception as exc:
+            self._log.debug(
+                "[%s] Skipping %s_unified view (mirror table may not exist yet): %s",
+                self.__class__.__name__, table, exc,
+            )
+
     async def _ensure_events_table_and_views(self, table: str, schema: TableSchema) -> None:
-        """Ensure the events schema, table, and both views exist for a source table."""
+        """Ensure the events schema, table, and all three views exist for a source table."""
         schema_sql = self._ensure_events_schema_sql(self._events_schema)
         if schema_sql:
             await self._execute_ddl(schema_sql)
         await self._execute_ddl(self._build_ensure_events_table_sql(table))
         await self._execute_ddl(self._build_current_view_sql(table))
         await self._execute_ddl(self._build_history_view_sql(table, schema))
+        # The unified view joins against the standard mirror table.  Only attempt creation
+        # when that table might already exist (populated by a prior bulk import).  If the
+        # mirror table is absent the DB raises an error which we catch and log at DEBUG.
+        await self._try_create_unified_view(table, schema)
 
     # ── Time-series: shared INSERT param builder ───────────────────────────────
 
@@ -288,7 +359,21 @@ class SqlDriverBase(Driver):
 
     @staticmethod
     def _coerce_value(v: Any) -> Any:
-        """Ensure complex Python objects are JSON-serialised before binding."""
+        """Ensure values are safe to bind into TEXT/NVARCHAR upsert columns.
+
+        - dicts and lists are JSON-serialised.
+        - booleans are coerced to "true"/"false" (checked before int since
+          bool is a subclass of int in Python).
+        - ints and floats are coerced to their string representation.
+        - None is left as None (NULL).
+        - strings pass through unchanged.
+        """
+        if v is None:
+            return None
         if isinstance(v, (dict, list)):
             return json.dumps(v)
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
         return v

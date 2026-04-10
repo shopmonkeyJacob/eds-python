@@ -169,7 +169,7 @@ All events tables share the same columns regardless of the source table structur
 
 ### Auto-maintained views
 
-Two views are automatically created and refreshed whenever the schema changes:
+Three views are automatically created and refreshed whenever the schema changes:
 
 **`current_{table}`** — latest state of each entity (equivalent to the upsert mirror):
 
@@ -187,6 +187,15 @@ FROM eds_events.work_orders_history
 WHERE id = 'wo-abc123'
 ORDER BY _timestamp;
 ```
+
+**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible:
+
+```sql
+-- Complete current state, including both CDC-updated and import-only rows
+SELECT * FROM eds_events.work_orders_unified;
+```
+
+> The `{table}_unified` view is only created once the standard mirror table exists (i.e. after a bulk import has been run). If no import has been performed, only `current_{table}` and `{table}_history` are created. The view is automatically created on the next `eds server` start once the mirror table is present.
 
 ### Point-in-time queries
 

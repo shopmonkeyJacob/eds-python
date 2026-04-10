@@ -170,7 +170,10 @@ class MySQLDriver(SqlDriverBase):
         for col in schema.column_defs():
             null = "" if col.nullable else " NOT NULL"
             pk = " PRIMARY KEY" if col.primary_key else ""
-            col_defs.append(f"  `{col.name}` TEXT{null}{pk}")
+            # MySQL requires a fixed-length type for PRIMARY KEY / indexed columns;
+            # TEXT cannot be used as a key without a prefix length.
+            col_type = "VARCHAR(64)" if col.primary_key else "TEXT"
+            col_defs.append(f"  `{col.name}` {col_type}{null}{pk}")
         ddl = f"CREATE TABLE IF NOT EXISTS `{schema.table}` (\n" + ",\n".join(col_defs) + "\n)"
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:

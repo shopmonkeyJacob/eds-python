@@ -49,6 +49,7 @@ eds = "eds.cli.main:cli"
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
+    "testcontainers>=4.0",
     "mypy>=1.8",
     "ruff>=0.3",
     "black>=24.0",
@@ -61,6 +62,9 @@ include = ["eds*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: marks tests as integration tests (require Docker)",
+]
 
 [tool.mypy]
 python_version = "3.11"
