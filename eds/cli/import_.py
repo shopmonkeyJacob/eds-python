@@ -176,7 +176,7 @@ async def _import(
         # Resolve filter lists once — used for both the initial job and any retries.
         tables = [t.strip() for t in only.split(",") if t.strip()] if only else None
         cids   = [c.strip() for c in company_ids.split(",")   if c.strip()] if company_ids   else None
-        lids   = [l.strip() for l in location_ids.split(",")  if l.strip()] if location_ids  else None
+        lids   = [loc.strip() for loc in location_ids.split(",")  if loc.strip()] if location_ids  else None
 
         # Export job
         if not job_id and not list(Path(import_dir).glob("*.ndjson*")):
