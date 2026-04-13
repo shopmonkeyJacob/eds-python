@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
-import boto3  # type: ignore[import]
+import boto3
 
 from eds.core.driver import (
     DriverField, FieldError,

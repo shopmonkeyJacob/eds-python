@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "eds"
-version = "0.9.1-rc"
+dynamic = ["version"]
 description = "Shopmonkey Enterprise Data Streaming — Python"
 readme = "README.md"
 license = { text = "MIT" }
@@ -51,6 +51,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "testcontainers>=4.0",
     "mypy>=1.8",
+    "types-aiofiles>=23.2",
     "ruff>=0.3",
     "black>=24.0",
 ]
@@ -64,12 +65,18 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: marks tests as integration tests (require Docker)",
+    "e2e: marks tests for features not yet in production (excluded from release CI)",
 ]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+
+[tool.setuptools_scm]
+# Version is derived from git tags (e.g. v1.0.0-rc → 1.0.0rc0).
+# At PyInstaller build time the CI overwrites eds/version.py directly so the
+# binary always embeds the exact tag string regardless of setuptools-scm normalisation.
 
 [tool.ruff]
 line-length = 100

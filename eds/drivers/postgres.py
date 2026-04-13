@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-import asyncpg  # type: ignore[import]
+import asyncpg
 
 from eds.core.driver import (
     DriverField, FieldError,

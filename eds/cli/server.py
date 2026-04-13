@@ -11,6 +11,8 @@ import signal
 import sys
 from pathlib import Path
 
+from typing import Any
+
 import aiohttp
 import click
 
@@ -209,7 +211,7 @@ async def _server(
                     _log.error("Upgrade failed: %s", exc)
                     return False, str(exc)
 
-            async def _on_configure(driver_url: str, backfill: bool) -> dict:
+            async def _on_configure(driver_url: str, backfill: bool) -> dict[str, Any]:
                 nonlocal url, driver
                 try:
                     await set_config_value(data_dir, "url", driver_url)
@@ -231,10 +233,10 @@ async def _server(
                 except Exception as exc:
                     return {"success": False, "error": str(exc)}
 
-            def _driver_config() -> dict:
+            def _driver_config() -> dict[str, Any]:
                 return {"drivers": get_driver_metadata()}
 
-            def _validate(scheme: str, values: dict) -> dict:
+            def _validate(scheme: str, values: dict[str, Any]) -> dict[str, Any]:
                 d = _registry.get(scheme)
                 if not d:
                     return {"success": False, "error": f"Unknown driver: {scheme}"}
@@ -391,7 +393,7 @@ async def _start_session(
     api_key: str,
     server_id: str,
     data_dir: str,
-) -> dict:
+) -> dict[str, Any]:
     """Start a new EDS session with Shopmonkey HQ and write the NATS credentials."""
     headers = {
         "Authorization": f"Bearer {api_key}",

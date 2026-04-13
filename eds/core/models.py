@@ -64,7 +64,7 @@ class DbChangeEvent:
             return self.key[-1]
         obj = self.get_object()
         if obj and isinstance(obj.get("id"), str):
-            return obj["id"]
+            return str(obj["id"])
         return ""
 
     def get_object(self) -> dict[str, Any] | None:

@@ -150,6 +150,24 @@ You can also specify an export job ID explicitly to attach to a known job withou
 eds import --job-id <export-job-id>
 ```
 
+#### Export timeout recovery
+
+Large exports can time out on the Shopmonkey side before all tables have finished generating. EDS handles this automatically:
+
+1. Any tables that already have download URLs are fetched immediately.
+2. A new targeted export job is created for the remaining tables.
+3. Steps 1–2 repeat up to **5 times** with exponential back-off between attempts:
+
+| Attempt | Delay before retry |
+|---------|--------------------|
+| 1       | 30 s               |
+| 2       | 60 s               |
+| 3       | 120 s              |
+| 4       | 240 s              |
+| 5       | 480 s              |
+
+If all 5 retries are exhausted without completing every table, the import exits with a fatal error and the partial results are preserved on disk so `--resume` can continue from where it left off.
+
 ## Time-Series Mode
 
 By default, SQL drivers mirror the source tables using **upsert** semantics — each row reflects the latest known state of the corresponding record in Shopmonkey.

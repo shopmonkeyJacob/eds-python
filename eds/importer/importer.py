@@ -112,7 +112,7 @@ async def create_export_job(
                 data = await resp.json()
                 if not data.get("success"):
                     raise RuntimeError(f"API error: {data.get('message', 'unknown')}")
-                return data["data"]["jobId"]
+                return str(data["data"]["jobId"])
 
     return await retry(_post, operation_name="create export job")
 
@@ -438,7 +438,7 @@ async def import_files(
             _log.info("[import] Processing %s", path.name)
             count = 0
             opener = gzip.open if path.suffix == ".gz" else open
-            with opener(path, "rb") as fh:  # type: ignore[call-overload]
+            with opener(path, "rb") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:

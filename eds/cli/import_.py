@@ -193,7 +193,7 @@ async def _import(
             await save_checkpoint(tracker, checkpoint)
 
         # Poll, download, and retry incomplete tables automatically on server-side timeout.
-        file_table_pairs: list = []
+        file_table_pairs: list[tuple[str, Path]] = []
         if job_id:
             table_infos, file_table_pairs = await poll_download_with_retry(
                 api_url, api_key, job_id, import_dir, checkpoint,

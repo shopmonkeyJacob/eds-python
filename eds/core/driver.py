@@ -118,6 +118,15 @@ class Driver(ABC):
     async def migrate_new_columns(self, schema: TableSchema, columns: list[str]) -> None:  # noqa: ARG002
         raise NotImplementedError
 
+    async def migrate_changed_columns(self, schema: TableSchema, columns: list[str]) -> None:  # noqa: ARG002
+        raise NotImplementedError
+
+    async def migrate_removed_columns(self, schema: TableSchema, columns: list[str]) -> None:  # noqa: ARG002
+        raise NotImplementedError
+
+    async def drop_orphan_tables(self, known_tables: set[str]) -> None:  # noqa: ARG002
+        raise NotImplementedError
+
     def supports_direct_import(self) -> bool:
         """Return True if this driver can receive raw .ndjson.gz files directly."""
         return False

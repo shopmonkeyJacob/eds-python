@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 import msgpack
 import nats
@@ -30,9 +30,9 @@ class NotificationHandlers:
     unpause: Callable[[], Awaitable[None]] | None = None
     upgrade: Callable[[str], Awaitable[tuple[bool, str | None]]] | None = None
     send_logs: Callable[[], Awaitable[tuple[bool, str | None]]] | None = None
-    driver_config: Callable[[], dict] | None = None
-    validate: Callable[[str, dict], dict] | None = None
-    configure: Callable[[str, bool], Awaitable[dict]] | None = None
+    driver_config: Callable[[], dict[str, Any]] | None = None
+    validate: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
+    configure: Callable[[str, bool], Awaitable[dict[str, Any]]] | None = None
     import_data: Callable[[bool], Awaitable[None]] | None = None
 
 
@@ -53,11 +53,10 @@ class NotificationService:
         self._sem = asyncio.Semaphore(MAX_CONCURRENT_HANDLERS)
 
     async def start(self) -> None:
-        options: list = []
-        if self._credentials_file:
-            options.append(nats.credentials(self._credentials_file))
-
-        self._nc = await nats.connect(self._nats_url, *options)
+        self._nc = await nats.connect(
+            self._nats_url,
+            user_credentials=self._credentials_file or None,
+        )
         subject = f"eds.notify.{self._session_id}.>"
         await self._nc.subscribe(subject, cb=self._on_message)
         _log.info("Notification service listening on %s", subject)
@@ -166,7 +165,7 @@ class NotificationService:
         else:
             _log.warning("Unknown notification action: %s", action)
 
-    def _parse_payload(self, msg: Msg) -> dict:
+    def _parse_payload(self, msg: Msg) -> dict[str, Any]:
         if not msg.data:
             return {}
         try:
@@ -175,16 +174,18 @@ class NotificationService:
                 ct = " ".join(ct)
             if "msgpack" in ct.lower():
                 raw = msgpack.unpackb(msg.data, raw=False)
-                return raw if isinstance(raw, dict) else {}
-            return json.loads(msg.data.decode())
+                return cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+            result: dict[str, Any] = json.loads(msg.data.decode())
+            return result
         except Exception:
             return {}
 
-    async def _reply_msgpack(self, msg: Msg, payload: dict) -> None:
+    async def _reply_msgpack(self, msg: Msg, payload: dict[str, Any]) -> None:
         data = msgpack.packb(payload, use_bin_type=True)
-        await msg.respond(data, headers={"content-encoding": "msgpack"})
+        if msg.reply and self._nc:
+            await self._nc.publish(msg.reply, data, headers={"content-encoding": "msgpack"})
 
-    async def _publish_response(self, action: str, payload: dict) -> None:
+    async def _publish_response(self, action: str, payload: dict[str, Any]) -> None:
         if not self._nc:
             return
         subject = f"eds.client.{self._session_id}.{action}-response"

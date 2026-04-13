@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import aiofiles  # type: ignore[import]
+import aiofiles
 
 from eds.core.driver import (
     DriverField, FieldError,

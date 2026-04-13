@@ -76,7 +76,7 @@ def _verify_signature(archive_bytes: bytes, sig_bytes: bytes, armored_public_key
     # Import lazily so startup is not affected; a compatible wheel or the
     # `cryptography`-based replacement can be swapped in here when available.
     try:
-        import pgpy  # type: ignore[import]
+        import pgpy
     except ImportError as exc:
         raise ImportError(
             "PGP verification requires pgpy. On Python 3.13+ install a compatible build: "
@@ -153,7 +153,7 @@ def _extract_zip(source: io.BytesIO, destination: str) -> None:
 
 
 def _extract_tar_gz(source: io.BytesIO, destination: str) -> None:
-    with gzip.GzipFile(fileobj=source) as gz, tarfile.open(fileobj=gz) as tf:  # type: ignore[arg-type]
+    with gzip.GzipFile(fileobj=source) as gz, tarfile.open(fileobj=gz) as tf:
         for member in tf.getmembers():
             if not member.isfile():
                 continue

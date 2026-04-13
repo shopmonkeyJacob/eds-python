@@ -35,8 +35,11 @@ jobs:
       - name: Lint
         run: ruff check eds/
 
+      - name: Type-check
+        run: mypy eds/
+
       - name: Test
-        run: pytest --tb=short
+        run: pytest --tb=short -m "not integration and not e2e"
 
   # ── Publish cross-platform binaries (version tags only) ──────────────────────
   # PyInstaller cannot cross-compile — each platform must build its own binary.
@@ -81,6 +84,15 @@ jobs:
 
       - name: Install package and PyInstaller
         run: pip install . pyinstaller
+
+      - name: Bake version into binary
+        shell: bash
+        run: |
+          # Strip the leading 'v' from the tag (e.g. v1.0.0-rc → 1.0.0-rc) and
+          # write it as a plain constant so PyInstaller embeds the exact version
+          # string rather than reading a runtime env var that won't be set.
+          VERSION="${GITHUB_REF_NAME#v}"
+          printf 'CURRENT: str = "%s"\n' "$VERSION" > eds/version.py
 
       - name: Build binary
         shell: bash

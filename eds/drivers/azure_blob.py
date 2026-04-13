@@ -6,7 +6,7 @@ import json
 from typing import Any
 from urllib.parse import urlparse, parse_qs, unquote
 
-from azure.storage.blob.aio import BlobServiceClient  # type: ignore[import]
+from azure.storage.blob.aio import BlobServiceClient
 
 from eds.core.driver import (
     DriverField, FieldError,
@@ -110,7 +110,7 @@ class AzureBlobDriver(Driver):
                 "data": evt.get_object(),
             }).encode()
             blob = container.get_blob_client(blob_name)
-            await blob.upload_blob(body, overwrite=True, content_settings=None)  # type: ignore[arg-type]
+            await blob.upload_blob(body, overwrite=True, content_settings=None)
 
         self._pending = []
 

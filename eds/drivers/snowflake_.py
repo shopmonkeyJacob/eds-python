@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
-import snowflake.connector  # type: ignore[import]
+import snowflake.connector
 
 from eds.core.driver import (
     DriverField, FieldError,

@@ -7,9 +7,9 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 try:
-    import pyodbc  # type: ignore[import]
+    import pyodbc
 except ImportError:
-    pyodbc = None  # type: ignore[assignment]
+    pyodbc = None
 
 from eds.core.driver import (
     DriverField, FieldError,

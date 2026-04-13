@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from confluent_kafka import Producer  # type: ignore[import]
+from confluent_kafka import Producer
 
 from eds.core.driver import (
     DriverField, FieldError,
@@ -131,7 +131,7 @@ class KafkaDriver(Driver):
             log.info("[import] Publishing %s", path.name)
             count = 0
             opener = gzip.open if path.suffix == ".gz" else open
-            with opener(path, "rb") as fh:  # type: ignore[call-overload]
+            with opener(path, "rb") as fh:
                 for raw_line in fh:
                     raw_line = raw_line.strip()
                     if not raw_line:
@@ -153,7 +153,7 @@ class KafkaDriver(Driver):
         log.info("[import] Published %d total record(s) to Kafka topic '%s'", total, self._topic)
 
 
-def _build_import_event(row: dict, table: str, raw_line: bytes) -> DbChangeEvent:
+def _build_import_event(row: dict[str, Any], table: str, raw_line: bytes) -> DbChangeEvent:
     """Build a synthetic INSERT DbChangeEvent from a raw CRDB export row."""
     record_id = row.get("id") or str(uuid.uuid4())
     company_id = row.get("companyId")

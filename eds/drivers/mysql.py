@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
-import aiomysql  # type: ignore[import]
+import aiomysql
 
 from eds.core.driver import (
     DriverField, FieldError,

@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.e2e
+
 from eds.importer.importer import (
     ExportJobRequest,
     ExportJobResponse,

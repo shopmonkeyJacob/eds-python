@@ -79,8 +79,9 @@ class Consumer:
         self._stopping = False
         self._disconnected: asyncio.Event = asyncio.Event()
 
-        self._bufferer_task: asyncio.Task | None = None  # type: ignore[type-arg]
-        self._heartbeat_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._js_cfg: ConsumerConfig | None = None
+        self._bufferer_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     @property
     def disconnected(self) -> asyncio.Event:
@@ -90,11 +91,6 @@ class Consumer:
 
     async def start(self) -> None:
         cfg = self._config
-        options: list[Any] = []
-
-        if cfg.credentials_file:
-            options.append(nats.credentials(cfg.credentials_file))
-
         def _on_closed(nc: NatsClient) -> None:
             if not self._stopping:
                 _log.warning("NATS connection closed unexpectedly")
@@ -107,7 +103,7 @@ class Consumer:
 
         self._nc = await nats.connect(
             cfg.nats_url,
-            *options,
+            user_credentials=cfg.credentials_file or None,
             closed_cb=_on_closed,
             disconnected_cb=_on_disconnect,
             name=f"eds-{cfg.server_id}",
@@ -120,7 +116,7 @@ class Consumer:
         ]
 
         js_cfg = ConsumerConfig(
-            durable=consumer_name,
+            durable_name=consumer_name,
             max_ack_pending=cfg.max_ack_pending,
             max_deliver=20,
             ack_wait=300,           # 5 minutes in seconds
@@ -150,15 +146,16 @@ class Consumer:
                 js_cfg.deliver_policy = DeliverPolicy.NEW
                 _log.warning("No import timestamp found — starting stream from now")
 
+        self._js_cfg = js_cfg
         try:
             self._subscription = await self._js.subscribe_bind(
-                "dbchange", consumer_name, cb=self._on_message
+                "dbchange", js_cfg, consumer_name, cb=self._on_message
             )
         except Exception:
             # Create consumer then subscribe
             await self._js.add_consumer("dbchange", js_cfg)
             self._subscription = await self._js.subscribe_bind(
-                "dbchange", consumer_name, cb=self._on_message
+                "dbchange", js_cfg, consumer_name, cb=self._on_message
             )
 
         self._bufferer_task = asyncio.create_task(self._bufferer(), name="eds-bufferer")
@@ -191,8 +188,9 @@ class Consumer:
         cfg = self._config
         consumer_name = f"eds-{cfg.server_id}"
         assert self._js is not None
+        assert self._js_cfg is not None
         self._subscription = await self._js.subscribe_bind(
-            "dbchange", consumer_name, cb=self._on_message
+            "dbchange", self._js_cfg, consumer_name, cb=self._on_message
         )
         self._pause_started = None
         _log.info("Consumer unpaused")

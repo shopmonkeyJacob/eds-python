@@ -6,6 +6,7 @@ from pathlib import Path
 
 import click
 
+from eds.version import CURRENT
 from eds.cli.server import server
 from eds.cli.import_ import import_cmd
 from eds.cli.enroll import enroll
@@ -26,7 +27,7 @@ def _configure_logging(verbose: bool) -> None:
               help="Directory for state, logs, and credentials.")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Enable debug-level console output.")
-@click.version_option(package_name="eds", prog_name="eds")
+@click.version_option(version=CURRENT, prog_name="eds")
 @click.pass_context
 def cli(ctx: click.Context, data_dir: str, verbose: bool) -> None:
     """Shopmonkey Enterprise Data Streaming — Python."""
