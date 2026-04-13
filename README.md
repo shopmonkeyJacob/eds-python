@@ -4,17 +4,20 @@ A Python port of Shopmonkey's Enterprise Data Streaming server. Connects to Shop
 
 ## Supported Drivers
 
-| Scheme       | Destination              | Import |
-|--------------|--------------------------|:------:|
-| `postgres`   | PostgreSQL / CockroachDB | ✓      |
-| `mysql`      | MySQL / MariaDB          | ✓      |
-| `sqlserver`  | SQL Server               | ✓      |
-| `snowflake`  | Snowflake                | ✓      |
-| `s3`         | Amazon S3                | ✓ ²    |
-| `azureblob`  | Azure Blob Storage       | ✓ ²    |
-| `file`       | Local NDJSON files       | ✓ ²    |
-| `kafka`      | Apache Kafka             | ✓ ³    |
-| `eventhub`   | Azure Event Hubs         | ✓ ³    |
+| Scheme       | Destination              | Import | Time-series | Add col | Change type | Drop col |
+|--------------|--------------------------|:------:|:-----------:|:-------:|:-----------:|:--------:|
+| `postgres`   | PostgreSQL / CockroachDB | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `mysql`      | MySQL / MariaDB          | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `sqlserver`  | SQL Server               | ✓      | ✓           | ✓       | ✓           | ✓        |
+| `snowflake`  | Snowflake                | ✓      | —           | ✓       | —           | —        |
+| `s3`         | Amazon S3                | ✓ ²    | —           | —       | —           | —        |
+| `azureblob`  | Azure Blob Storage       | ✓ ²    | —           | —       | —           | —        |
+| `file`       | Local NDJSON files       | ✓ ²    | —           | —       | —           | —        |
+| `kafka`      | Apache Kafka             | ✓ ³    | —           | —       | —           | —        |
+| `eventhub`   | Azure Event Hubs         | ✓ ³    | —           | —       | —           | —        |
+
+- **Time-series** — supports `--driver-mode timeseries` (append-only event log with auto-maintained views)
+- **Add col / Change type / Drop col** — automatic DDL migrations when the Shopmonkey schema evolves
 
 > ² S3, Azure Blob Storage, and File drivers transfer raw `.ndjson.gz` export files directly to the destination, preserving the filename and per-table directory structure. No row-level parsing is performed — the export format is already the natural storage format for these drivers.
 >
@@ -22,12 +25,45 @@ A Python port of Shopmonkey's Enterprise Data Streaming server. Connects to Shop
 
 ## Requirements
 
-- Python 3.11+
 - A Shopmonkey account with EDS access
+- **Pre-built binaries:** no additional requirements
+- **Install from source:** Python 3.11+
 
 ## Installation
 
+### Pre-built binaries (recommended)
+
+Download the latest release from the [GitHub Releases](../../releases) page:
+
+| Platform            | Asset                    |
+|---------------------|--------------------------|
+| macOS (Apple Silicon) | `eds-osx-arm64.tar.gz` |
+| Linux x64           | `eds-linux-x64.tar.gz`   |
+| Windows x64         | `eds-win-x64.zip`        |
+
+Extract and run:
+
 ```sh
+# macOS / Linux
+tar xzf eds-osx-arm64.tar.gz
+./eds server
+
+# Windows (PowerShell)
+Expand-Archive eds-win-x64.zip .
+.\eds.exe server
+```
+
+### Install from source
+
+```sh
+pip install .
+```
+
+It is recommended to install inside a virtual environment:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install .
 ```
 
@@ -39,26 +75,7 @@ pip install ".[dev]"
 
 ## Quick Start
 
-1. Download or clone this repository, then install from the project root:
-
-   ```sh
-   pip install /path/to/eds-python
-   ```
-
-   Or, if you are already inside the project directory:
-
-   ```sh
-   pip install .
-   ```
-
-   It is recommended to install inside a virtual environment:
-
-   ```sh
-   python3 -m venv .venv
-   source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install .
-   ```
-
+1. Install using one of the methods above.
 2. Run `eds server` — on first launch you will be prompted for a one-time enrollment code from the [Shopmonkey HQ web interface](https://app.shopmonkey.io).
 3. Configure your destination driver in the web interface. EDS will begin streaming events as soon as a driver URL is saved.
 
@@ -332,6 +349,7 @@ token        = "your-shopmonkey-jwt"
 server_id    = "your-server-id"
 url          = "postgres://user:password@localhost:5432/mydb"
 driver_mode  = "upsert"
+events_schema = "eds_events"   # optional; must match [A-Za-z0-9_]{1,128}
 ```
 
 Environment variables prefixed with `EDS_` override any value in `config.toml`:
@@ -381,6 +399,45 @@ ExecStart=/usr/local/bin/eds server
 Restart=always
 RestartSec=5
 RestartForceExitStatus=4 5
+```
+
+## Building Binaries
+
+Each GitHub release automatically builds self-contained, single-file binaries for all three platforms using [PyInstaller](https://pyinstaller.org). No Python installation is required to run them.
+
+The workflow lives at `.github/workflows/build.yml`. Binaries are produced on a push to a `v*` tag:
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+This triggers the `publish` matrix job, which builds on the native runner for each platform:
+
+| Platform            | Runner            |
+|---------------------|-------------------|
+| macOS (Apple Silicon) | `macos-14`      |
+| Linux x64           | `ubuntu-latest`   |
+| Windows x64         | `windows-latest`  |
+
+The `release` job then collects all three archives and creates a GitHub Release with auto-generated release notes (commits since the previous tag).
+
+To build a binary locally:
+
+```sh
+pip install . pyinstaller
+pyinstaller --onefile --name eds \
+  --hidden-import eds.drivers.postgres \
+  --hidden-import eds.drivers.mysql \
+  --hidden-import eds.drivers.sqlserver \
+  --hidden-import eds.drivers.snowflake_ \
+  --hidden-import eds.drivers.s3 \
+  --hidden-import eds.drivers.azure_blob \
+  --hidden-import eds.drivers.kafka_ \
+  --hidden-import eds.drivers.eventhub \
+  --hidden-import eds.drivers.file_ \
+  eds/__main__.py
+# Output: dist/eds  (or dist/eds.exe on Windows)
 ```
 
 ## Running Tests

@@ -96,14 +96,21 @@ class KafkaDriver(Driver):
                 }).encode()
                 self._producer.produce(
                     self._topic, key=key, value=value,
-                    headers={"table": evt.table, "operation": evt.operation},
+                    headers={
+                        "table": evt.table.encode(),
+                        "operation": evt.operation.encode(),
+                    },
                 )
             self._producer.flush()
 
         events = list(self._pending)
         self._pending = []
         assert self._loop
-        await self._loop.run_in_executor(None, lambda: _produce(events))
+        try:
+            await self._loop.run_in_executor(None, lambda: _produce(events))
+        except Exception:
+            self._pending = events  # restore on error so caller can retry or NAK
+            raise
 
     async def test(self, url: str) -> None:
         await self.start(DriverConfig(url=url, logger=logging.getLogger(__name__), data_dir=""))
@@ -131,7 +138,8 @@ class KafkaDriver(Driver):
                         continue
                     try:
                         row = json.loads(raw_line)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as exc:
+                        log.warning("[import] Skipping invalid JSON line in %s: %s", path.name, exc)
                         continue
                     evt = _build_import_event(row, table, raw_line)
                     await self.process(evt)
@@ -150,13 +158,15 @@ def _build_import_event(row: dict, table: str, raw_line: bytes) -> DbChangeEvent
     record_id = row.get("id") or str(uuid.uuid4())
     company_id = row.get("companyId")
     location_id = row.get("locationId")
+    # Mirrors Go: LocationId uses locationId but falls back to companyId when locationId is absent.
+    effective_location_id = company_id or location_id
     return DbChangeEvent(
         operation="INSERT",
         id=record_id,
         table=table,
         key=[record_id],
         company_id=company_id,
-        location_id=company_id or location_id,
+        location_id=effective_location_id,
         after=raw_line,
         imported=True,
     )

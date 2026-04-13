@@ -7,6 +7,7 @@ Environment variables prefixed with EDS_ override config.toml values.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass, field
@@ -49,7 +50,13 @@ def load_config(data_dir: str) -> EdsConfig:
         cfg.api_url = raw.get("api_url", cfg.api_url)
         cfg.keep_logs = bool(raw.get("keep_logs", False))
         cfg.driver_mode = raw.get("driver_mode", "")
-        cfg.events_schema = raw.get("events_schema", "")
+        raw_schema = raw.get("events_schema", "")
+        if raw_schema and not re.match(r'^[A-Za-z0-9_]{1,128}$', raw_schema):
+            raise ValueError(
+                f"Invalid events_schema name {raw_schema!r} in config.toml. "
+                "Must contain only ASCII letters, digits, and underscores (1–128 chars)."
+            )
+        cfg.events_schema = raw_schema
         if "metrics" in raw:
             m = raw["metrics"]
             cfg.metrics.port = int(m.get("port", 8080))
@@ -95,7 +102,7 @@ async def set_config_value(data_dir: str, key: str, value: str) -> None:
     if config_path.exists():
         for line in config_path.read_text().splitlines():
             stripped = line.strip()
-            if stripped.startswith(f"{key}") and "=" in stripped:
+            if re.match(rf'^{re.escape(key)}\s*=', stripped):
                 lines.append(f'{key} = "{value}"')
                 found = True
             else:

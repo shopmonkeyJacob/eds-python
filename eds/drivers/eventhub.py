@@ -92,6 +92,7 @@ class EventHubDriver(Driver):
         if not self._pending or not self._producer:
             return
 
+        batches: list = []
         batch = await self._producer.create_batch()
         for evt in self._pending:
             body = json.dumps({
@@ -101,9 +102,17 @@ class EventHubDriver(Driver):
                 "timestamp": evt.timestamp,
                 "data": evt.get_object(),
             }).encode()
-            batch.add(EventData(body))
+            try:
+                batch.add(EventData(body))
+            except Exception:
+                # Batch is full — queue it and open a fresh one
+                batches.append(batch)
+                batch = await self._producer.create_batch()
+                batch.add(EventData(body))
+        batches.append(batch)
 
-        await self._producer.send_batch(batch)
+        for b in batches:
+            await self._producer.send_batch(b)
         self._pending = []
 
     async def test(self, url: str) -> None:
@@ -133,7 +142,8 @@ class EventHubDriver(Driver):
                         continue
                     try:
                         row = json.loads(raw_line)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as exc:
+                        log.warning("[import] Skipping invalid JSON line in %s: %s", path.name, exc)
                         continue
                     evt = _build_import_event(row, table, raw_line)
                     await self.process(evt)
@@ -152,13 +162,15 @@ def _build_import_event(row: dict, table: str, raw_line: bytes) -> DbChangeEvent
     record_id = row.get("id") or str(uuid.uuid4())
     company_id = row.get("companyId")
     location_id = row.get("locationId")
+    # Mirrors Go: LocationId uses locationId but falls back to companyId when locationId is absent.
+    effective_location_id = company_id or location_id
     return DbChangeEvent(
         operation="INSERT",
         id=record_id,
         table=table,
         key=[record_id],
         company_id=company_id,
-        location_id=company_id or location_id,
+        location_id=effective_location_id,
         after=raw_line,
         imported=True,
     )

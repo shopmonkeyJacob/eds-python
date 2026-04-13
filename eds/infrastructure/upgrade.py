@@ -85,6 +85,8 @@ def _verify_signature(archive_bytes: bytes, sig_bytes: bytes, armored_public_key
 
     key, _ = pgpy.PGPKey.from_blob(armored_public_key)
     sig, _ = pgpy.PGPSignature.from_blob(sig_bytes)
+    if sig is None:
+        raise PermissionError("PGP signature could not be parsed from the release asset.")
     msg = pgpy.PGPMessage.new(archive_bytes, sensitive=False)
     if not key.verify(msg, sig):
         raise PermissionError(

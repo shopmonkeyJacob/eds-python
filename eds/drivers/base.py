@@ -12,11 +12,32 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from abc import abstractmethod
 from typing import Any
 
 from eds.core.driver import Driver, DriverConfig, DriverMode
 from eds.core.models import DbChangeEvent, TableSchema
+
+# Pattern that all Shopmonkey table/column names must match.
+# Restricts to ASCII word characters only — no SQL metacharacters, quotes,
+# semicolons, or other characters that could escape quoting contexts.
+_SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z0-9_]{1,128}$')
+
+
+def _assert_safe_identifier(name: str) -> None:
+    """Raise ValueError if *name* is not a safe SQL identifier.
+
+    All table and column names that originate from the NATS wire (event.table,
+    schema column names) are passed through this guard before being interpolated
+    into any SQL string.  This prevents a compromised or spoofed NATS stream
+    from injecting arbitrary SQL through a crafted table name.
+    """
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe SQL identifier rejected: {name!r}. "
+            "Identifiers must contain only ASCII letters, digits, and underscores."
+        )
 
 
 class SqlDriverBase(Driver):
@@ -79,6 +100,7 @@ class SqlDriverBase(Driver):
         if not self._pending:
             return
         for evt in self._pending:
+            _assert_safe_identifier(evt.table)
             # Imported events (bulk import snapshot) always go to the standard mirror
             # table via upsert, regardless of driver mode. Time-series events tables
             # are populated by the live CDC stream once the server starts.
@@ -107,12 +129,18 @@ class SqlDriverBase(Driver):
         return False
 
     async def migrate_new_table(self, schema: TableSchema) -> None:
+        _assert_safe_identifier(schema.table)
+        for col in schema.column_defs():
+            _assert_safe_identifier(col.name)
         if self._mode == DriverMode.TIMESERIES:
             await self._ensure_events_table_and_views(schema.table, schema)
         else:
             await self._migrate_new_table_upsert(schema)
 
     async def migrate_new_columns(self, schema: TableSchema, columns: list[str]) -> None:
+        _assert_safe_identifier(schema.table)
+        for col in columns:
+            _assert_safe_identifier(col)
         if self._mode == DriverMode.TIMESERIES:
             # Events table schema is fixed — just refresh all three views.
             await self._execute_ddl(self._build_current_view_sql(schema.table))
@@ -123,12 +151,18 @@ class SqlDriverBase(Driver):
 
     async def migrate_changed_columns(self, schema: TableSchema, columns: list[str]) -> None:
         """Alter the type of columns whose data_type changed in the HQ schema."""
+        _assert_safe_identifier(schema.table)
+        for col in columns:
+            _assert_safe_identifier(col)
         if self._mode == DriverMode.TIMESERIES:
             return  # events table schema is fixed
         await self._migrate_changed_columns_upsert(schema, columns)
 
     async def migrate_removed_columns(self, schema: TableSchema, columns: list[str]) -> None:
         """Drop columns that were removed from the HQ schema."""
+        _assert_safe_identifier(schema.table)
+        for col in columns:
+            _assert_safe_identifier(col)
         if self._mode == DriverMode.TIMESERIES:
             return
         await self._migrate_removed_columns_upsert(schema, columns)

@@ -7,8 +7,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from eds.infrastructure.tracker import SqliteTracker
+    from eds.infrastructure.schema_registry import SchemaRegistry
 
 from eds.core.models import DbChangeEvent, TableSchema
 
@@ -47,8 +51,8 @@ class DriverConfig:
     url: str
     logger: logging.Logger
     data_dir: str
-    tracker: Any = None          # infrastructure.tracker.SqliteTracker
-    schema_registry: Any = None  # infrastructure.schema_registry.SchemaRegistry
+    tracker: SqliteTracker | None = None
+    schema_registry: SchemaRegistry | None = None
     mode: DriverMode = DriverMode.UPSERT
     events_schema: str = "eds_events"
 

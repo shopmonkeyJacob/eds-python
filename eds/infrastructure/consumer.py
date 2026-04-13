@@ -226,10 +226,18 @@ class Consumer:
             received_ms = time.monotonic() * 1000
             try:
                 data = msg.data
-                evt = DbChangeEvent.from_dict(json.loads(data))
+                headers = msg.headers or {}
+                ct = headers.get("Content-Type") or headers.get("content-type") or ""
+                ce = headers.get("content-encoding") or headers.get("Content-Encoding") or ""
+                if "msgpack" in ct or "msgpack" in ce:
+                    payload = msgpack.unpackb(data, raw=False)
+                else:
+                    payload = json.loads(data)
+                evt = DbChangeEvent.from_dict(payload)
             except Exception as exc:
                 _log.error("Failed to decode message: %s", exc)
                 await self._nack_everything()
+                self._disconnected.set()
                 return
 
             # MVCC timestamp filtering — skip events from before the import cutoff
@@ -254,6 +262,7 @@ class Consumer:
             if err:
                 _log.error("Driver.process error: %s", err)
                 await self._nack_everything()
+                self._disconnected.set()
                 return
 
             driver_max = driver.max_batch_size()
@@ -384,7 +393,11 @@ class Consumer:
             proc = psutil.Process()
             cpu = psutil.cpu_percent(interval=None)
             mem = proc.memory_info().rss
-        except Exception:
+        except ImportError:
+            _log.debug("psutil not available; heartbeat metrics will be zero")
+            cpu, mem = 0.0, 0
+        except Exception as exc:
+            _log.debug("Failed to gather process metrics for heartbeat: %s", exc)
             cpu, mem = 0.0, 0
 
         hb = {

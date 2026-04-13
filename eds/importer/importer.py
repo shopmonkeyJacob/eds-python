@@ -117,14 +117,23 @@ async def create_export_job(
     return await retry(_post, operation_name="create export job")
 
 
+_POLL_TIMEOUT_SECONDS = 4 * 60 * 60  # 4 hours — export jobs should never take this long
+
+
 async def poll_until_complete(
     api_url: str,
     api_key: str,
     job_id: str,
 ) -> ExportJobResponse:
     last_logged = datetime.min
+    deadline = datetime.now(timezone.utc).timestamp() + _POLL_TIMEOUT_SECONDS
 
     while True:
+        if datetime.now(timezone.utc).timestamp() > deadline:
+            raise TimeoutError(
+                f"Export job {job_id!r} did not complete within "
+                f"{_POLL_TIMEOUT_SECONDS // 3600} hours."
+            )
         now = datetime.now(timezone.utc)
         if (now - last_logged.replace(tzinfo=timezone.utc)).total_seconds() > 60:
             _log.info("[import] Checking export status (%s)", job_id)
@@ -277,51 +286,61 @@ def _parse_timestamp_from_filename(filename: str) -> datetime | None:
 async def import_files(
     driver: Driver,
     files: list[Path],
+    parallel: int = 4,
     dry_run: bool = False,
     tracker: Tracker | None = None,
     checkpoint: ImportCheckpoint | None = None,
 ) -> None:
-    """Feed .ndjson.gz export files through the driver one record at a time."""
+    """Feed .ndjson.gz export files through the driver one record at a time.
+
+    *parallel* controls the maximum number of files processed concurrently.
+    A semaphore limits concurrency so that memory pressure stays bounded even
+    when hundreds of export files are present.
+    """
     completed = set(checkpoint.completed_files if checkpoint else [])
+    sem = asyncio.Semaphore(max(1, parallel))
 
-    for path in files:
-        if str(path) in completed:
-            _log.debug("[import] Skipping already-completed file: %s", path.name)
-            continue
+    async def _process_file(path: Path) -> None:
+        async with sem:
+            if str(path) in completed:
+                _log.debug("[import] Skipping already-completed file: %s", path.name)
+                return
 
-        _log.info("[import] Processing %s", path.name)
-        count = 0
-        opener = gzip.open if path.suffix == ".gz" else open
-        with opener(path, "rb") as fh:  # type: ignore[call-overload]
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    raw = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    _log.warning("[import] Skipping invalid JSON line in %s: %s", path.name, exc)
-                    continue
+            _log.info("[import] Processing %s", path.name)
+            count = 0
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rb") as fh:  # type: ignore[call-overload]
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        raw = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        _log.warning("[import] Skipping invalid JSON line in %s: %s", path.name, exc)
+                        continue
 
-                evt = DbChangeEvent.from_dict(raw)
-                evt.imported = True
-                if not dry_run:
-                    await driver.process(evt)
-                count += 1
+                    evt = DbChangeEvent.from_dict(raw)
+                    evt.imported = True
+                    if not dry_run:
+                        await driver.process(evt)
+                    count += 1
 
-        if not dry_run:
-            await driver.flush()
+            if not dry_run:
+                await driver.flush()
 
-        _log.info("[import] %s: %d records", path.name, count)
+            _log.info("[import] %s: %d records", path.name, count)
 
-        if tracker and checkpoint:
-            checkpoint.completed_files.append(str(path))
-            await tracker.set_key(_CHECKPOINT_KEY, json.dumps({
-                "jobId": checkpoint.job_id,
-                "downloadDir": checkpoint.download_dir,
-                "completedFiles": checkpoint.completed_files,
-                "startedAt": checkpoint.started_at,
-            }))
+            if tracker and checkpoint:
+                checkpoint.completed_files.append(str(path))
+                await tracker.set_key(_CHECKPOINT_KEY, json.dumps({
+                    "jobId": checkpoint.job_id,
+                    "downloadDir": checkpoint.download_dir,
+                    "completedFiles": checkpoint.completed_files,
+                    "startedAt": checkpoint.started_at,
+                }))
+
+    await asyncio.gather(*(_process_file(p) for p in files))
 
 
 async def import_files_direct(
