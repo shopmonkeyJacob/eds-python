@@ -119,6 +119,21 @@ async def create_export_job(
 
 _POLL_TIMEOUT_SECONDS = 4 * 60 * 60  # 4 hours — export jobs should never take this long
 
+# Backoff delays (seconds) between successive import retries — doubles each time up to 8 min.
+_IMPORT_RETRY_DELAYS = [30, 60, 120, 240, 480]
+
+
+class ExportTimeoutError(TimeoutError):
+    """Raised when an export job times out or one or more tables fail server-side.
+
+    *partial_job* holds the last known ``ExportJobResponse``, allowing the caller
+    to identify which tables completed (have ``urls``) and which still need retrying.
+    """
+
+    def __init__(self, message: str, partial_job: ExportJobResponse | None = None) -> None:
+        super().__init__(message)
+        self.partial_job = partial_job
+
 
 async def poll_until_complete(
     api_url: str,
@@ -127,12 +142,14 @@ async def poll_until_complete(
 ) -> ExportJobResponse:
     last_logged = datetime.min
     deadline = datetime.now(timezone.utc).timestamp() + _POLL_TIMEOUT_SECONDS
+    last_job: ExportJobResponse | None = None
 
     while True:
         if datetime.now(timezone.utc).timestamp() > deadline:
-            raise TimeoutError(
+            raise ExportTimeoutError(
                 f"Export job {job_id!r} did not complete within "
-                f"{_POLL_TIMEOUT_SECONDS // 3600} hours."
+                f"{_POLL_TIMEOUT_SECONDS // 3600} hours.",
+                partial_job=last_job,
             )
         now = datetime.now(timezone.utc)
         if (now - last_logged.replace(tzinfo=timezone.utc)).total_seconds() > 60:
@@ -149,9 +166,14 @@ async def poll_until_complete(
                 continue
             raise
 
-        for table, data in job.tables.items():
-            if data.status == "Failed":
-                raise RuntimeError(f"Export of table '{table}' failed: {data.error}")
+        last_job = job
+
+        failed = [name for name, data in job.tables.items() if data.status == "Failed"]
+        if failed:
+            raise ExportTimeoutError(
+                f"Export of {len(failed)} table(s) failed server-side: {failed}",
+                partial_job=job,
+            )
 
         _log.debug("[import] Export status: %s", job.progress_string())
         if job.completed:
@@ -159,6 +181,113 @@ async def poll_until_complete(
             return job
 
         await asyncio.sleep(5)
+
+
+async def poll_download_with_retry(
+    api_url: str,
+    api_key: str,
+    initial_job_id: str,
+    dest_dir: str,
+    checkpoint: ImportCheckpoint | None = None,
+    company_ids: list[str] | None = None,
+    location_ids: list[str] | None = None,
+    max_retries: int = 5,
+) -> tuple[list[TableExportInfo], list[tuple[str, Path]]]:
+    """Poll *initial_job_id* then download results, retrying incomplete tables on failure.
+
+    When the server times out or individual tables fail, any tables that have already
+    received download URLs are fetched immediately.  A fresh targeted export job is then
+    created for the remaining tables and polled again, up to *max_retries* times with
+    exponential back-off (30 s → 60 s → 120 s → 240 s → 480 s).
+
+    Returns the accumulated ``(table_infos, file_table_pairs)`` across all sub-jobs.
+    """
+    all_table_infos: list[TableExportInfo] = []
+    all_file_table_pairs: list[tuple[str, Path]] = []
+
+    current_job_id = initial_job_id
+    # None means "all tables from this job"; populated after the first timeout.
+    pending_tables: list[str] | None = None
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            delay = _IMPORT_RETRY_DELAYS[min(attempt - 1, len(_IMPORT_RETRY_DELAYS) - 1)]
+            _log.warning(
+                "[import] Retry %d/%d — %d table(s) still pending, backing off %ds: %s",
+                attempt, max_retries, len(pending_tables or []), delay, pending_tables,
+            )
+            await asyncio.sleep(delay)
+
+            # Start a new targeted export for just the tables that didn't finish.
+            sub_request = ExportJobRequest(
+                tables=pending_tables,
+                company_ids=company_ids,
+                location_ids=location_ids,
+            )
+            current_job_id = await create_export_job(api_url, api_key, sub_request)
+            _log.info(
+                "[import] Retry export job created: %s (tables: %s)",
+                current_job_id, pending_tables,
+            )
+
+        try:
+            job = await poll_until_complete(api_url, api_key, current_job_id)
+            # All tables in this sub-job succeeded.
+            ti, fp = await bulk_download(job, dest_dir, checkpoint)
+            all_table_infos.extend(ti)
+            all_file_table_pairs.extend(fp)
+            _log.info(
+                "[import] Sub-job complete — %d table(s) downloaded (attempt %d/%d).",
+                len(ti), attempt + 1, max_retries + 1,
+            )
+            return all_table_infos, all_file_table_pairs
+
+        except ExportTimeoutError as exc:
+            partial = exc.partial_job
+
+            # Separate completed tables (have URLs) from those that still need retrying.
+            completed_data: dict[str, TableExportData] = {}
+            still_pending: list[str] = []
+            if partial:
+                for name, data in partial.tables.items():
+                    if data.urls:
+                        completed_data[name] = data
+                    else:
+                        still_pending.append(name)
+            elif pending_tables:
+                still_pending = list(pending_tables)
+
+            # Download whatever completed before the timeout/failure.
+            if completed_data:
+                partial_response = ExportJobResponse(completed=False, tables=completed_data)
+                ti, fp = await bulk_download(partial_response, dest_dir, checkpoint)
+                all_table_infos.extend(ti)
+                all_file_table_pairs.extend(fp)
+                _log.info(
+                    "[import] Downloaded %d table(s) from partial job before timeout.",
+                    len(ti),
+                )
+
+            _log.warning(
+                "[import] %d table(s) did not complete on attempt %d/%d: %s",
+                len(still_pending), attempt + 1, max_retries + 1, still_pending,
+            )
+
+            if not still_pending:
+                # Everything with URLs was downloaded — treat as success.
+                return all_table_infos, all_file_table_pairs
+
+            pending_tables = still_pending
+
+            if attempt == max_retries:
+                raise ExportTimeoutError(
+                    f"Import failed after {max_retries} retries. "
+                    f"{len(pending_tables)} table(s) never completed: {pending_tables}",
+                    partial_job=partial,
+                ) from exc
+
+    # Unreachable, but satisfies the type checker.
+    return all_table_infos, all_file_table_pairs
 
 
 async def _check_job(api_url: str, api_key: str, job_id: str) -> ExportJobResponse:

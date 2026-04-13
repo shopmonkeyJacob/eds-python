@@ -17,8 +17,7 @@ from eds.importer.importer import (
     ExportJobRequest,
     ImportCheckpoint,
     create_export_job,
-    poll_until_complete,
-    bulk_download,
+    poll_download_with_retry,
     import_files,
     load_checkpoint,
     save_checkpoint,
@@ -174,11 +173,13 @@ async def _import(
             import_dir = tempfile.mkdtemp(prefix="eds-import-")
             cleanup_dir = not no_cleanup
 
+        # Resolve filter lists once — used for both the initial job and any retries.
+        tables = [t.strip() for t in only.split(",") if t.strip()] if only else None
+        cids   = [c.strip() for c in company_ids.split(",")   if c.strip()] if company_ids   else None
+        lids   = [l.strip() for l in location_ids.split(",")  if l.strip()] if location_ids  else None
+
         # Export job
         if not job_id and not list(Path(import_dir).glob("*.ndjson*")):
-            tables = [t.strip() for t in only.split(",") if t.strip()] if only else None
-            cids = [c.strip() for c in company_ids.split(",") if c.strip()] if company_ids else None
-            lids = [loc.strip() for loc in location_ids.split(",") if loc.strip()] if location_ids else None
             request = ExportJobRequest(tables=tables, company_ids=cids, location_ids=lids)
             job_id = await create_export_job(api_url, api_key, request)
             _log.info("[import] Created export job: %s", job_id)
@@ -191,11 +192,13 @@ async def _import(
             )
             await save_checkpoint(tracker, checkpoint)
 
-        # Download
+        # Poll, download, and retry incomplete tables automatically on server-side timeout.
         file_table_pairs: list = []
         if job_id:
-            job = await poll_until_complete(api_url, api_key, job_id)
-            table_infos, file_table_pairs = await bulk_download(job, import_dir, checkpoint)
+            table_infos, file_table_pairs = await poll_download_with_retry(
+                api_url, api_key, job_id, import_dir, checkpoint,
+                company_ids=cids, location_ids=lids,
+            )
             await save_table_export_info(tracker, table_infos)
 
         if not dry_run and not no_confirm and not no_delete:
