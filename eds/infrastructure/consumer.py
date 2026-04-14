@@ -31,6 +31,7 @@ from eds.core.driver import Driver
 from eds.core.models import DbChangeEvent
 from eds.infrastructure import metrics
 from eds.infrastructure.schema_registry import SchemaRegistry
+from eds.infrastructure.tracker import SqliteTracker
 
 _log = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ DEFAULT_MAX_PENDING_LATENCY = 30.0  # seconds
 DEFAULT_HEARTBEAT_INTERVAL = 60.0   # seconds
 DEFAULT_MAX_ACK_PENDING = 25_000
 EMPTY_BUFFER_PAUSE = 0.01           # seconds — prevents CPU spin
+
+MAX_FLUSH_RETRIES = 5
+# Exponential backoff delays for flush retries: 2s → 4s → 8s → 16s → 30s
+_FLUSH_RETRY_DELAYS = [2.0, 4.0, 8.0, 16.0, 30.0]
 
 
 @dataclass
@@ -58,6 +63,7 @@ class ConsumerConfig_:
     heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL
     min_pending_latency: float = DEFAULT_MIN_PENDING_LATENCY
     max_pending_latency: float = DEFAULT_MAX_PENDING_LATENCY
+    tracker: SqliteTracker | None = None
 
 
 class Consumer:
@@ -65,6 +71,7 @@ class Consumer:
 
     def __init__(self, config: ConsumerConfig_) -> None:
         self._config = config
+        self._tracker = config.tracker
         self._nc: NatsClient | None = None
         self._js: JetStreamContext | None = None
         self._subscription: Any = None
@@ -234,7 +241,7 @@ class Consumer:
                 evt = DbChangeEvent.from_dict(payload)
             except Exception as exc:
                 _log.error("Failed to decode message: %s", exc)
-                await self._nack_everything()
+                await self._nack_everything(error=f"Decode error: {exc}")
                 self._disconnected.set()
                 return
 
@@ -259,7 +266,7 @@ class Consumer:
 
             if err:
                 _log.error("Driver.process error: %s", err)
-                await self._nack_everything()
+                await self._nack_everything(error=f"Driver.process error: {err}")
                 self._disconnected.set()
                 return
 
@@ -281,11 +288,34 @@ class Consumer:
         if not self._pending:
             return
         t0 = time.monotonic()
-        try:
-            await self._config.driver.flush()
-        except Exception as exc:
-            _log.error("Driver.flush error: %s", exc)
-            await self._nack_everything()
+        last_exc: Exception | None = None
+
+        for attempt in range(1, MAX_FLUSH_RETRIES + 1):
+            try:
+                await self._config.driver.flush()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < MAX_FLUSH_RETRIES:
+                    delay = _FLUSH_RETRY_DELAYS[attempt - 1]
+                    _log.warning(
+                        "[consumer] Flush attempt %d/%d failed — retrying in %.0fs: %s",
+                        attempt, MAX_FLUSH_RETRIES, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+                    # Driver clears its buffer on failure (contract); re-queue events for next attempt.
+                    for _msg, evt, _ms in self._pending:
+                        try:
+                            await self._config.driver.process(evt)
+                        except Exception as requeue_exc:
+                            _log.warning(
+                                "[consumer] Failed to re-queue %s/%s for retry — event may be skipped: %s",
+                                evt.table, evt.id, requeue_exc,
+                            )
+
+        if last_exc is not None:
+            await self._handle_flush_failure(last_exc)
             return
 
         acked_ms = time.monotonic() * 1000
@@ -301,6 +331,50 @@ class Consumer:
         metrics.flush_count.observe(len(self._pending))
         self._pending = []
         self._pending_started = None
+
+    async def _handle_flush_failure(self, exc: Exception) -> None:
+        """Called after all flush retry attempts are exhausted.
+
+        Writes the batch to the dead-letter queue, ACKs the NATS messages to
+        permanently remove them from the stream, and returns — the consumer
+        continues processing new events without shutting down.
+        """
+        error_msg = str(exc)
+        _log.error(
+            "[consumer] Flush failed after %d attempt(s) — %d event(s) will be moved to the dead-letter queue.",
+            MAX_FLUSH_RETRIES, len(self._pending),
+        )
+        full_error = f"Driver.flush error after {MAX_FLUSH_RETRIES} attempts: {error_msg}"
+
+        if self._tracker and self._pending:
+            try:
+                await self._tracker.push_dlq(self._pending, full_error, retry_count=MAX_FLUSH_RETRIES)
+                _log.warning(
+                    "[dlq] %d event(s) permanently failed after %d flush attempts — moved to dead-letter queue.",
+                    len(self._pending), MAX_FLUSH_RETRIES,
+                )
+                for _msg, evt, _ms in self._pending:
+                    _log.debug(
+                        "[dlq] event_id=%s table=%s op=%s company=%s error=%s",
+                        evt.id, evt.table, evt.operation, evt.company_id, error_msg,
+                    )
+            except Exception as dlq_exc:
+                _log.error(
+                    "[dlq] Failed to write %d event(s) to dead-letter queue — entries will be lost: %s",
+                    len(self._pending), dlq_exc,
+                )
+
+        # ACK to permanently remove from NATS — do not NAK (events are now in the DLQ).
+        for msg, _evt, _ms in self._pending:
+            try:
+                await msg.ack()
+            except Exception as ack_exc:
+                _log.error("ACK error for DLQ event: %s", ack_exc)
+            metrics.pending_events.dec()
+
+        self._pending = []
+        self._pending_started = None
+        # Do NOT set _disconnected — the consumer continues processing new events.
 
     # ── Schema migration (mirrors Go/C# handlePossibleMigration) ─────────────
 
@@ -364,7 +438,26 @@ class Consumer:
 
         await registry.set_table_version(evt.table, model_version)
 
-    async def _nack_everything(self) -> None:
+    async def _nack_everything(self, error: str | None = None) -> None:
+        """NAK all pending messages.
+
+        When *error* is provided and a tracker is configured, each event is
+        also persisted to the dead-letter queue so operators can inspect and
+        replay permanently-failed events.
+        """
+        if error and self._tracker and self._pending:
+            try:
+                await self._tracker.push_dlq(self._pending, error)
+                _log.warning("[dlq] %d event(s) moved to dead-letter queue in state.db.", len(self._pending))
+                for _msg, evt, _ms in self._pending:
+                    _log.debug(
+                        "[dlq] event_id=%s table=%s op=%s company=%s error=%s",
+                        evt.id, evt.table, evt.operation, evt.company_id, error,
+                    )
+            except Exception as dlq_exc:
+                _log.error("[dlq] Failed to write %d event(s) to dead-letter queue — entries will be lost: %s",
+                           len(self._pending), dlq_exc)
+
         for msg, _evt, _ms in self._pending:
             try:
                 await msg.nak()

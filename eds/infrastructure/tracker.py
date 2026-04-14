@@ -1,4 +1,4 @@
-"""SQLite-backed key-value tracker.
+"""SQLite-backed key-value tracker and dead-letter queue.
 
 Mirrors internal/tracker/tracker.go (backed by BuntDB in Go).
 Uses stdlib sqlite3 — no external dependency required.
@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, TYPE_CHECKING
 
 from eds.core.tracker import Tracker
 
+if TYPE_CHECKING:
+    from eds.core.models import DbChangeEvent
+
 
 class SqliteTracker(Tracker):
-    """Thread-safe, file-backed key-value store using SQLite."""
+    """Thread-safe, file-backed key-value store and dead-letter queue using SQLite."""
 
     def __init__(self, db_path: str | Path) -> None:
         self._path = str(db_path)
@@ -23,9 +28,25 @@ class SqliteTracker(Tracker):
 
     async def open(self) -> None:
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS dlq (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                failed_at   TEXT    NOT NULL,
+                event_id    TEXT    NOT NULL,
+                table_name  TEXT    NOT NULL,
+                operation   TEXT    NOT NULL,
+                company_id  TEXT,
+                location_id TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error       TEXT    NOT NULL,
+                payload     TEXT
+            )
+        """)
         self._conn.commit()
 
     async def get_key(self, key: str) -> str | None:
@@ -47,6 +68,61 @@ class SqliteTracker(Tracker):
         assert self._conn, "Tracker not open"
         async with self._lock:
             self._conn.executemany("DELETE FROM kv WHERE key = ?", [(k,) for k in keys])
+            self._conn.commit()
+
+    # ── Dead-letter queue ──────────────────────────────────────────────────────
+
+    async def push_dlq(
+        self,
+        pending: list[tuple[Any, "DbChangeEvent", float]],
+        error: str,
+        retry_count: int = 0,
+    ) -> None:
+        """Persist *pending* events to the ``dlq`` table.
+
+        Each row stores the event metadata and the raw After (or Before for
+        deletes) JSON payload so operators can inspect or replay failed events.
+        """
+        if not pending or not self._conn:
+            return
+
+        failed_at   = datetime.now(timezone.utc).isoformat()
+        error_trunc = error[:2000] if len(error) > 2000 else error
+
+        async with self._lock:
+            cursor = self._conn.cursor()
+            for _msg, evt, _received_ms in pending:
+                payload: str | None = None
+                if evt.after:
+                    try:
+                        payload = evt.after.decode()
+                    except Exception:
+                        payload = None
+                elif evt.before:
+                    try:
+                        payload = evt.before.decode()
+                    except Exception:
+                        payload = None
+
+                cursor.execute(
+                    """
+                    INSERT INTO dlq
+                        (failed_at, event_id, table_name, operation,
+                         company_id, location_id, retry_count, error, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        failed_at,
+                        evt.id,
+                        evt.table,
+                        evt.operation,
+                        evt.company_id,
+                        evt.location_id,
+                        retry_count,
+                        error_trunc,
+                        payload,
+                    ),
+                )
             self._conn.commit()
 
     async def close(self) -> None:

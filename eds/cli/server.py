@@ -166,6 +166,7 @@ async def _server(
                 api_key=api_key,
                 registry=registry,
                 export_table_timestamps=export_timestamps,
+                tracker=tracker,
             )
             consumer = Consumer(consumer_cfg)
 

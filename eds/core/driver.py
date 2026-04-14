@@ -78,7 +78,11 @@ class Driver(ABC):
 
     @abstractmethod
     async def flush(self) -> None:
-        """Commit all pending events."""
+        """Commit all pending events.
+
+        If this method raises, implementations MUST clear their internal buffer
+        so that events can be safely re-queued via process() without duplication.
+        """
 
     @abstractmethod
     async def test(self, url: str) -> None:

@@ -213,50 +213,11 @@ Three views are automatically created and refreshed whenever the schema changes:
 SELECT * FROM eds_events.current_work_orders;
 ```
 
-**`{table}_history`** — full audit trail with each schema column extracted from the JSON payloads:
+**`{table}_history`** — full audit trail with each schema column extracted from the JSON payloads.
 
-```sql
--- Example: full change history for a specific work order
-SELECT _seq, _operation, _timestamp, id, status, total
-FROM eds_events.work_orders_history
-WHERE id = 'wo-abc123'
-ORDER BY _timestamp;
-```
-
-**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible:
-
-```sql
--- Complete current state, including both CDC-updated and import-only rows
-SELECT * FROM eds_events.work_orders_unified;
-```
+**`{table}_unified`** — complete current dataset combining CDC events with the mirror table baseline. Records that have received CDC events use the event-derived state; records that exist only in the mirror table (e.g. rows imported before the live server began streaming) are surfaced directly from the mirror, so the full dataset is always visible.
 
 > The `{table}_unified` view is only created once the standard mirror table exists (i.e. after a bulk import has been run). If no import has been performed, only `current_{table}` and `{table}_history` are created. The view is automatically created on the next `eds server` start once the mirror table is present.
-
-### Point-in-time queries
-
-To reconstruct the state of all records at a specific moment, use a window function directly against the events table:
-
-```sql
--- State of all work orders as of a specific Unix millisecond timestamp
-SELECT * FROM (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY _entity_id ORDER BY _timestamp DESC, _seq DESC) AS rn
-  FROM eds_events.work_orders_events
-  WHERE _timestamp <= 1743897600000   -- 2025-02-06T00:00:00Z
-) t
-WHERE rn = 1 AND _operation <> 'DELETE';
-```
-
-### Joining across tables in time-series mode
-
-When joining time-series tables, use the auto-maintained views to get current state on both sides:
-
-```sql
--- Current work orders joined to current customer
-SELECT wo.id, wo.status, c.name AS customer_name
-FROM eds_events.current_work_orders wo
-JOIN eds_events.current_customers c ON c.id = wo.customer_id;
-```
 
 ### Usage
 
@@ -350,11 +311,11 @@ Each table's events are written as NDJSON to `{directory}/{table}/{timestamp}.nd
 
 At runtime EDS creates a `data/` directory (or the path set by `--data-dir`) containing:
 
-| File / Directory   | Description                                          |
-|--------------------|------------------------------------------------------|
-| `config.toml`      | Server settings — API token, driver URL, server ID   |
-| `state.db`         | SQLite database for change-tracking and import state |
-| `<session-id>/`    | NATS credentials for the current session             |
+| File / Directory   | Description                                                                    |
+|--------------------|--------------------------------------------------------------------------------|
+| `config.toml`      | Server settings — API token, driver URL, server ID                             |
+| `state.db`         | SQLite database for change-tracking, import state, and the dead-letter queue   |
+| `<session-id>/`    | NATS credentials for the current session                                       |
 
 > **Keep `data/` out of source control.** It contains your API token and NATS credentials.
 
@@ -378,6 +339,50 @@ Environment variables prefixed with `EDS_` override any value in `config.toml`:
 | `EDS_URL`       | `url`          |
 | `EDS_SERVER_ID` | `server_id`    |
 | `EDS_API_URL`   | `api_url`      |
+
+## Dead-Letter Queue
+
+When a batch of events cannot be flushed to the destination after all retry attempts, EDS writes each event to a **dead-letter queue** table in `data/state.db` rather than silently dropping it. This gives you a permanent record of what failed and the context needed to investigate.
+
+### When events are queued
+
+Events are moved to the DLQ when `flush()` fails after **5 retry attempts** (with 2 s → 4 s → 8 s → 16 s → 30 s backoff). At that point:
+
+- A `WARNING`-level log line is always written: `[dlq] N event(s) moved to dead-letter queue in state.db.`
+- Per-event `DEBUG`-level lines are written to the log file at all times, and to the console when `--verbose` is active.
+- The failed events are **ACKed** in NATS so they are permanently removed from the stream and will not block future processing.
+- The consumer continues running and processes the next incoming event normally.
+
+Decode errors and driver `process()` errors are handled differently — those still NAK the batch and trigger a session reconnect, since they indicate a problem with a specific message rather than a transient destination failure.
+
+### Querying the DLQ
+
+The `dlq` table lives inside `data/state.db` alongside the existing key-value state. You can inspect it with any SQLite client:
+
+```sh
+sqlite3 data/state.db "SELECT failed_at, table_name, operation, error FROM dlq ORDER BY id DESC LIMIT 20;"
+```
+
+### DLQ table schema
+
+| Column        | Type    | Description                                             |
+|---------------|---------|---------------------------------------------------------|
+| `id`          | INTEGER | Auto-increment primary key                              |
+| `failed_at`   | TEXT    | ISO 8601 timestamp when the entry was written           |
+| `event_id`    | TEXT    | Unique event ID from Shopmonkey                         |
+| `table_name`  | TEXT    | Source table (e.g. `work_orders`)                       |
+| `operation`   | TEXT    | `insert`, `update`, or `delete`                         |
+| `company_id`  | TEXT    | Shopmonkey company ID (nullable)                        |
+| `location_id` | TEXT    | Shopmonkey location ID (nullable)                       |
+| `retry_count` | INTEGER | Number of flush attempts before giving up               |
+| `error`       | TEXT    | Error message (truncated to 2 000 characters)           |
+| `payload`     | TEXT    | Raw JSON of the `after` payload (or `before` for deletes) |
+
+### What to do
+
+1. Check the `error` column to understand the root cause (network outage, schema mismatch, permission error, etc.), then fix the underlying problem.
+2. Once the issue is resolved, re-apply DLQ events manually if needed by extracting the `payload` column and replaying via the destination driver.
+3. Clear handled entries: `DELETE FROM dlq WHERE id <= <last-reviewed-id>;`
 
 ## Metrics & Status
 
@@ -440,23 +445,7 @@ This triggers the `publish` matrix job, which builds on the native runner for ea
 
 The `release` job then collects all three archives and creates a GitHub Release with auto-generated release notes (commits since the previous tag).
 
-To build a binary locally:
-
-```sh
-pip install . pyinstaller
-pyinstaller --onefile --name eds \
-  --hidden-import eds.drivers.postgres \
-  --hidden-import eds.drivers.mysql \
-  --hidden-import eds.drivers.sqlserver \
-  --hidden-import eds.drivers.snowflake_ \
-  --hidden-import eds.drivers.s3 \
-  --hidden-import eds.drivers.azure_blob \
-  --hidden-import eds.drivers.kafka_ \
-  --hidden-import eds.drivers.eventhub \
-  --hidden-import eds.drivers.file_ \
-  eds/__main__.py
-# Output: dist/eds  (or dist/eds.exe on Windows)
-```
+To build a binary locally, refer to the PyInstaller invocation in `.github/workflows/build.yml` — it includes the full `--hidden-import` list needed to bundle all driver modules.
 
 ## Running Tests
 
@@ -464,7 +453,7 @@ pyinstaller --onefile --name eds \
 pytest
 ```
 
-The test suite requires no external services. Tests cover CDC event parsing, retry logic, and the SQLite tracker.
+The test suite requires no external services. Tests cover CDC event parsing, retry logic, SQLite tracker CRUD, and dead-letter queue persistence.
 
 ## Architecture
 
@@ -480,6 +469,7 @@ NotificationService
 ```
 
 - **CDC events** arrive via NATS JetStream, are buffered in an asyncio queue, and flushed to the driver in batches with exponential-backoff retry on transient failures.
+- **Dead-letter queue** — events that cannot be flushed are persisted to the `dlq` table in `state.db` so they can be inspected and replayed. See [Dead-Letter Queue](#dead-letter-queue).
 - **Notifications** from HQ allow the web interface to configure the driver, trigger a backfill import, pause/unpause streaming, and initiate in-place binary upgrades.
 - **Schema registry** tracks table model versions and triggers DDL migrations when the Shopmonkey data model changes.
 - **Pause handling** NAKs messages with a 30-second server-side delay so paused sessions do not create a tight redelivery loop.
