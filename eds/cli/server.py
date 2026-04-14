@@ -19,7 +19,7 @@ import click
 from eds.exit_codes import ExitCodes
 from eds.infrastructure.config import EdsConfig, load_config, set_config_value
 from eds.infrastructure.consumer import Consumer, ConsumerConfig_
-from eds.infrastructure.metrics import start_metrics_server
+from eds.infrastructure.metrics import start_metrics_server, health
 from eds.infrastructure.notification import NotificationHandlers, NotificationService
 from eds.infrastructure.tracker import SqliteTracker
 from eds.infrastructure.schema_registry import SchemaRegistry
@@ -292,6 +292,8 @@ async def _server(
 
             # Start session services
             await consumer.start()
+            health.set_info(CURRENT, session_id, url)
+            health.set_consumer_running(True)
             await notify_svc.start()
             renewal_task = asyncio.create_task(_renewal_timer())
             disconnect_task = asyncio.create_task(_watch_disconnect())

@@ -174,6 +174,8 @@ By default, SQL drivers mirror the source tables using **upsert** semantics — 
 
 Passing `--driver-mode timeseries` switches all SQL drivers to an **append-only event log** model. Every CDC event is inserted as a new row; no rows are ever updated or deleted. This enables full audit history and point-in-time queries at the cost of needing to join against the latest event per entity when you want current state.
 
+> **Warning:** Because no rows are ever updated or deleted, time-series tables grow without bound. High-volume tables can accumulate very large datasets over time. Periodic compaction — such as deleting events older than a retention window — is the responsibility of your DBA and is outside the scope of EDS.
+
 ### Events table schema
 
 For each Shopmonkey table `{table}`, a fixed-schema table is created:
@@ -384,21 +386,55 @@ sqlite3 data/state.db "SELECT failed_at, table_name, operation, error FROM dlq O
 2. Once the issue is resolved, re-apply DLQ events manually if needed by extracting the `payload` column and replaying via the destination driver.
 3. Clear handled entries: `DELETE FROM dlq WHERE id <= <last-reviewed-id>;`
 
-## Metrics & Status
+## Metrics, Health & Observability
 
-EDS exposes an HTTP server on port **8080** (configurable via the `[metrics]` section of `config.toml`). By default it binds to `localhost` only. Two endpoints are available:
+EDS exposes an HTTP server on port **8080** (configurable via the `[metrics]` section of `config.toml`). By default it binds to `localhost` only.
 
-| Endpoint   | Format     | Description                                              |
-|------------|------------|----------------------------------------------------------|
-| `/metrics` | Prometheus | Counters and gauges for scraping by Prometheus / Grafana |
-| `/status`  | JSON       | Human-readable runtime snapshot                          |
+### Endpoints
 
-### Configuring the metrics port
+| Endpoint         | Format     | HTTP codes    | Description |
+|------------------|------------|:-------------:|-------------|
+| `/metrics`       | Prometheus | `200`         | Counters and gauges for scraping by Prometheus / Grafana |
+| `/status`        | JSON       | `200`         | Human-readable runtime snapshot |
+| `/healthz/live`  | JSON       | `200` / `503` | **Liveness** — `503` if the consumer loop has stopped (use for k8s `livenessProbe`) |
+| `/healthz/ready` | JSON       | `200` / `503` | **Readiness** — `503` if NATS is disconnected or the consumer has stopped (use for k8s `readinessProbe`) |
+
+Probe bodies always contain a `status` field (`"ok"` or `"unavailable"`) and a `checks` map:
+
+```json
+// 200 — healthy
+{ "status": "ok",          "checks": { "nats": "ok", "consumer": "ok" } }
+
+// 200 — paused (intentional, still connected)
+{ "status": "ok",          "checks": { "nats": "ok", "consumer": "paused" } }
+
+// 503 — NATS disconnected
+{ "status": "unavailable", "checks": { "nats": "disconnected", "consumer": "ok" } }
+```
+
+### Server configuration
 
 ```toml
 [metrics]
-port = 9090   # default: 8080
-host = "0.0.0.0"  # expose on all interfaces (needed for Docker/k8s); default is "localhost"
+port = 9090      # default: 8080
+host = "0.0.0.0" # expose on all interfaces (needed for Docker/k8s); default is "localhost"
+```
+
+### Kubernetes probe configuration
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz/live
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 30
+readinessProbe:
+  httpGet:
+    path: /healthz/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
 ```
 
 ## Session Renewal

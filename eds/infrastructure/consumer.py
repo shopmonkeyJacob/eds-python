@@ -101,11 +101,13 @@ class Consumer:
         def _on_closed(nc: NatsClient) -> None:
             if not self._stopping:
                 _log.warning("NATS connection closed unexpectedly")
+                metrics.health.set_nats_connected(False)
                 self._disconnected.set()
 
         def _on_disconnect(nc: NatsClient) -> None:
             if not self._stopping:
                 _log.error("NATS disconnected")
+                metrics.health.set_nats_connected(False)
                 self._disconnected.set()
 
         self._nc = await nats.connect(
@@ -115,6 +117,7 @@ class Consumer:
             disconnected_cb=_on_disconnect,
             name=f"eds-{cfg.server_id}",
         )
+        metrics.health.set_nats_connected(True)
         self._js = self._nc.jetstream()
 
         consumer_name = f"eds-{cfg.server_id}"
@@ -171,6 +174,8 @@ class Consumer:
 
     async def stop(self) -> None:
         self._stopping = True
+        metrics.health.set_consumer_running(False)
+        metrics.health.set_nats_connected(False)
         await self._flush()
         if self._subscription:
             await self._subscription.drain()
@@ -189,6 +194,7 @@ class Consumer:
             await self._subscription.drain()
             self._subscription = None
         self._pause_started = datetime.now(timezone.utc)
+        metrics.health.set_paused(True)
         _log.info("Consumer paused")
 
     async def unpause(self) -> None:
@@ -200,6 +206,7 @@ class Consumer:
             "dbchange", self._js_cfg, consumer_name, cb=self._on_message
         )
         self._pause_started = None
+        metrics.health.set_paused(False)
         _log.info("Consumer unpaused")
 
     # ── Message handling ───────────────────────────────────────────────────────
@@ -256,6 +263,8 @@ class Consumer:
             self._pending.append((msg, evt, received_ms))
             if self._pending_started is None:
                 self._pending_started = time.monotonic()
+            metrics.health.record_event(evt.table)
+            metrics.health.set_pending_flush(len(self._pending))
 
             force_flush, err = False, None
             try:
@@ -329,6 +338,8 @@ class Consumer:
 
         metrics.flush_duration.observe(time.monotonic() - t0)
         metrics.flush_count.observe(len(self._pending))
+        metrics.health.record_flush(len(self._pending))
+        metrics.health.set_pending_flush(0)
         self._pending = []
         self._pending_started = None
 
@@ -372,6 +383,7 @@ class Consumer:
                 _log.error("ACK error for DLQ event: %s", ack_exc)
             metrics.pending_events.dec()
 
+        metrics.health.set_pending_flush(0)
         self._pending = []
         self._pending_started = None
         # Do NOT set _disconnected — the consumer continues processing new events.
@@ -463,6 +475,7 @@ class Consumer:
                 await msg.nak()
             except Exception:
                 pass
+        metrics.health.set_pending_flush(0)
         self._pending = []
         self._pending_started = None
 
