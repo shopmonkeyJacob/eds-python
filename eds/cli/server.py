@@ -25,7 +25,7 @@ from eds.infrastructure.notification import NotificationHandlers, NotificationSe
 from eds.infrastructure.tracker import SqliteTracker
 from eds.infrastructure.schema_registry import SchemaRegistry
 from eds.infrastructure.upgrade import upgrade, validate_version_string
-from eds.core.driver import new_driver, DriverConfig, DriverMode, get_driver_metadata, _registry
+from eds.core.driver import new_driver, NullDriver, Driver, DriverConfig, DriverMode, get_driver_metadata, _registry
 from eds.version import CURRENT
 
 import eds.drivers  # noqa: F401
@@ -47,6 +47,8 @@ _RENEW_INTERVAL = 60 * 60 * 24  # 24 hours
               help="Schema name for time-series events tables (default: eds_events).")
 @click.option("--renew-interval", default=_RENEW_INTERVAL, hidden=True,
               help="Session renewal interval in seconds.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+              help="Receive and decode events without writing to a destination.")
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -56,11 +58,12 @@ def server(
     driver_mode: str | None,
     events_schema: str | None,
     renew_interval: int,
+    dry_run: bool,
 ) -> None:
     """Start the EDS streaming server."""
     data_dir: str = ctx.obj["data_dir"]
     try:
-        asyncio.run(_server(data_dir, api_key, api_url, url, driver_mode, events_schema, renew_interval))
+        asyncio.run(_server(data_dir, api_key, api_url, url, driver_mode, events_schema, renew_interval, dry_run))
     except KeyboardInterrupt:
         pass
 
@@ -73,6 +76,7 @@ async def _server(
     driver_mode_flag: str | None,
     events_schema_flag: str | None,
     renew_interval: int,
+    dry_run: bool = False,
 ) -> None:
     cfg = load_config(data_dir)
     api_key = api_key or cfg.token
@@ -82,6 +86,12 @@ async def _server(
     if not api_key:
         raise click.ClickException(
             "API key not found. Run `eds enroll` or set EDS_TOKEN."
+        )
+
+    if dry_run:
+        _log.warning(
+            "[dry-run] Running in dry-run mode — events will be received and decoded "
+            "but NOT written to any destination."
         )
 
     # Resolve driver mode (flag vs config, persist if changed, prompt on conflict)
@@ -132,8 +142,11 @@ async def _server(
             # Per-session resources
             registry = SchemaRegistry(api_url=api_url, api_key=api_key, tracker=tracker)
 
-            driver = None
-            if url:
+            driver: Driver | None = None
+            if dry_run:
+                driver = NullDriver()
+                _log.info("[dry-run] NullDriver active — no writes will occur.")
+            elif url:
                 driver_cfg = DriverConfig(
                     url=url,
                     logger=logging.getLogger("driver"),
@@ -218,6 +231,8 @@ async def _server(
 
             async def _on_configure(driver_url: str, backfill: bool) -> dict[str, Any]:
                 nonlocal url, driver
+                if dry_run:
+                    return {"success": False, "error": "Cannot reconfigure driver in dry-run mode."}
                 try:
                     await set_config_value(data_dir, "url", driver_url)
                     if driver:

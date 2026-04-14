@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 from eds.core.models import DbChangeEvent, TableSchema
 
+_log = logging.getLogger(__name__)
+
 
 class DriverMode(str, Enum):
     UPSERT = "upsert"
@@ -141,6 +143,52 @@ class Driver(ABC):
         file_table_pairs: list of (table_name, local_file_path) tuples.
         """
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# NullDriver — no-op driver for --dry-run mode
+# ---------------------------------------------------------------------------
+
+class NullDriver(Driver):
+    """No-op driver used in --dry-run mode.
+
+    Every event is logged at INFO level but nothing is written to a destination.
+    Flush is also a no-op — the pending count is reset and logged so operators
+    can verify event flow and schema decode without touching a real database.
+    """
+
+    def __init__(self) -> None:
+        self._pending = 0
+
+    async def start(self, config: DriverConfig) -> None:  # noqa: ARG002
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def max_batch_size(self) -> int:
+        return -1
+
+    async def process(self, event: DbChangeEvent) -> bool:
+        self._pending += 1
+        _log.info(
+            "[dry-run] Would process: op=%s table=%s id=%s company=%s",
+            event.operation, event.table, event.id, event.company_id,
+        )
+        return False
+
+    async def flush(self) -> None:
+        count, self._pending = self._pending, 0
+        _log.info("[dry-run] Would flush %d event(s) — no writes performed.", count)
+
+    async def test(self, url: str) -> None:  # noqa: ARG002
+        pass
+
+    def configuration(self) -> list[DriverField]:
+        return []
+
+    def validate(self, values: dict[str, Any]) -> tuple[str, list[FieldError]]:  # noqa: ARG002
+        return "", []
 
 
 # ---------------------------------------------------------------------------
