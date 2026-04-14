@@ -124,7 +124,7 @@ class HealthState:
 
     # ── Probe responses (called from HTTP server daemon thread) ───────────────
 
-    def liveness(self) -> tuple[int, dict]:
+    def liveness(self) -> tuple[int, dict[str, object]]:
         """200 while the consumer loop is running; 503 if it has stopped."""
         with self._lock:
             running = self._consumer_running
@@ -134,7 +134,7 @@ class HealthState:
             "checks": {"consumer": "ok" if running else "stopped"},
         }
 
-    def readiness(self) -> tuple[int, dict]:
+    def readiness(self) -> tuple[int, dict[str, object]]:
         """200 when NATS is connected and the consumer is active."""
         with self._lock:
             connected = self._nats_connected
@@ -149,7 +149,7 @@ class HealthState:
             },
         }
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, object]:
         """Full status snapshot for the /status endpoint."""
         with self._lock:
             last_at = self._last_event_at

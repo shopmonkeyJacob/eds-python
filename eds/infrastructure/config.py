@@ -21,6 +21,36 @@ class MetricsConfig:
 
 
 @dataclass
+class AlertChannelConfig:
+    """Configuration for one outbound alert channel, parsed from [[alerts.channels]]."""
+    type: str = ""                                                # slack | pagerduty | webhook | email
+    severity: list[str] = field(default_factory=lambda: ["warning", "critical"])
+
+    # Slack / generic webhook
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+    # PagerDuty Events API v2
+    routing_key: str = ""
+
+    # Email (SMTP)
+    host: str = ""
+    port: int = 587
+    username: str = ""
+    password: str = ""
+    from_addr: str = ""                                           # mapped from TOML key "from"
+    to_addrs: list[str] = field(default_factory=list)            # mapped from TOML key "to"
+    use_tls: bool = True
+
+
+@dataclass
+class AlertsConfig:
+    """Parsed from the [alerts] section of config.toml."""
+    cooldown_seconds: int = 300
+    channels: list[AlertChannelConfig] = field(default_factory=list)
+
+
+@dataclass
 class EdsConfig:
     token: str = ""
     server_id: str = ""
@@ -30,6 +60,8 @@ class EdsConfig:
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     driver_mode: str = ""        # "upsert" | "timeseries" — empty means use default
     events_schema: str = ""      # events schema name — empty means use default
+
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
     # Runtime — not persisted
     data_dir: str = "data"
@@ -61,6 +93,24 @@ def load_config(data_dir: str) -> EdsConfig:
             m = raw["metrics"]
             cfg.metrics.port = int(m.get("port", 8080))
             cfg.metrics.host = m.get("host", "localhost")
+        if "alerts" in raw:
+            a = raw["alerts"]
+            cfg.alerts.cooldown_seconds = int(a.get("cooldown_seconds", 300))
+            for ch_raw in a.get("channels", []):
+                cfg.alerts.channels.append(AlertChannelConfig(
+                    type=ch_raw.get("type", ""),
+                    severity=list(ch_raw.get("severity", ["warning", "critical"])),
+                    url=ch_raw.get("url", ""),
+                    headers=dict(ch_raw.get("headers", {})),
+                    routing_key=ch_raw.get("routing_key", ""),
+                    host=ch_raw.get("host", ""),
+                    port=int(ch_raw.get("port", 587)),
+                    username=ch_raw.get("username", ""),
+                    password=ch_raw.get("password", ""),
+                    from_addr=ch_raw.get("from", ""),
+                    to_addrs=list(ch_raw.get("to", [])),
+                    use_tls=bool(ch_raw.get("use_tls", True)),
+                ))
 
     # Environment overrides
     cfg.token = os.environ.get("EDS_TOKEN", cfg.token)

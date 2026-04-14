@@ -437,6 +437,65 @@ readinessProbe:
   periodSeconds: 10
 ```
 
+## Alerting
+
+EDS can push alert notifications to external incident management systems when critical events occur — flush retries, dead-letter queue writes, and NATS disconnections.
+
+**Alert events and default severity:**
+
+| Event | Severity |
+|---|---|
+| Flush retry attempt (before max retries) | `warning` |
+| Events moved to dead-letter queue (after all retries) | `critical` |
+| NATS connection lost | `critical` |
+| Consumer session fatal error (decode / process failure) | `critical` |
+
+### Supported channels
+
+| Type | Notes |
+|---|---|
+| `slack` | Incoming webhook URL |
+| `pagerduty` | Events API v2 — requires a routing key |
+| `webhook` | Generic HTTP POST with optional custom headers |
+| `email` | SMTP with optional STARTTLS |
+
+### Configuration
+
+```toml
+[alerts]
+cooldown_seconds = 300   # suppress duplicate alerts within this window; default: 300
+
+[[alerts.channels]]
+type     = "slack"
+url      = "https://hooks.slack.com/services/..."
+severity = ["warning", "critical"]   # default: ["warning", "critical"]
+
+[[alerts.channels]]
+type        = "pagerduty"
+routing_key = "your-routing-key"
+severity    = ["critical"]
+
+[[alerts.channels]]
+type = "webhook"
+url  = "https://example.com/hooks/eds"
+# optional custom headers
+[alerts.channels.headers]
+Authorization = "Bearer secret"
+
+[[alerts.channels]]
+type     = "email"
+host     = "smtp.example.com"
+port     = 587
+username = "eds@example.com"
+password = "smtp-password"
+from     = "eds@example.com"
+to       = ["oncall@example.com", "team@example.com"]
+use_tls  = true         # STARTTLS; default: true
+severity = ["critical"]
+```
+
+The `cooldown_seconds` setting deduplicates rapid-fire alerts: an alert with the same title on the same channel is suppressed until the cooldown window has elapsed. This prevents alert storms during sustained failures.
+
 ## Session Renewal
 
 EDS automatically restarts every 24 hours to obtain a fresh session and NATS credentials from Shopmonkey HQ. The restart is clean — all in-flight events are flushed before shutdown. If you are running EDS under a process supervisor (systemd, Docker, etc.), configure it to restart on any exit code.

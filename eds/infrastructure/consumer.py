@@ -30,6 +30,7 @@ from nats.js.api import ConsumerConfig, AckPolicy, DeliverPolicy
 from eds.core.driver import Driver
 from eds.core.models import DbChangeEvent
 from eds.infrastructure import metrics
+from eds.infrastructure.alerting import Alert, AlertManager, SEVERITY_CRITICAL, SEVERITY_WARNING
 from eds.infrastructure.schema_registry import SchemaRegistry
 from eds.infrastructure.tracker import SqliteTracker
 
@@ -64,6 +65,7 @@ class ConsumerConfig_:
     min_pending_latency: float = DEFAULT_MIN_PENDING_LATENCY
     max_pending_latency: float = DEFAULT_MAX_PENDING_LATENCY
     tracker: SqliteTracker | None = None
+    alerter: AlertManager | None = None
 
 
 class Consumer:
@@ -72,6 +74,7 @@ class Consumer:
     def __init__(self, config: ConsumerConfig_) -> None:
         self._config = config
         self._tracker = config.tracker
+        self._alerter = config.alerter
         self._nc: NatsClient | None = None
         self._js: JetStreamContext | None = None
         self._subscription: Any = None
@@ -312,6 +315,18 @@ class Consumer:
                         "[consumer] Flush attempt %d/%d failed — retrying in %.0fs: %s",
                         attempt, MAX_FLUSH_RETRIES, delay, exc,
                     )
+                    if self._alerter:
+                        try:
+                            await self._alerter.fire(Alert(
+                                title="EDS flush retry",
+                                body=(
+                                    f"Flush attempt {attempt}/{MAX_FLUSH_RETRIES} failed: {exc}. "
+                                    f"Retrying in {delay:.0f}s."
+                                ),
+                                severity=SEVERITY_WARNING,
+                            ))
+                        except Exception as _ae:
+                            _log.debug("[alerting] Alert fire failed: %s", _ae)
                     await asyncio.sleep(delay)
                     # Driver clears its buffer on failure (contract); re-queue events for next attempt.
                     for _msg, evt, _ms in self._pending:
@@ -356,6 +371,19 @@ class Consumer:
             MAX_FLUSH_RETRIES, len(self._pending),
         )
         full_error = f"Driver.flush error after {MAX_FLUSH_RETRIES} attempts: {error_msg}"
+
+        if self._alerter:
+            try:
+                await self._alerter.fire(Alert(
+                    title="EDS events moved to dead-letter queue",
+                    body=(
+                        f"{len(self._pending)} event(s) permanently failed after "
+                        f"{MAX_FLUSH_RETRIES} flush attempts and were moved to the dead-letter queue: {error_msg}"
+                    ),
+                    severity=SEVERITY_CRITICAL,
+                ))
+            except Exception as _ae:
+                _log.debug("[alerting] Alert fire failed: %s", _ae)
 
         if self._tracker and self._pending:
             try:
@@ -457,6 +485,16 @@ class Consumer:
         also persisted to the dead-letter queue so operators can inspect and
         replay permanently-failed events.
         """
+        if error and self._alerter:
+            try:
+                await self._alerter.fire(Alert(
+                    title="EDS consumer session error",
+                    body=f"Consumer session is restarting due to a fatal error: {error}",
+                    severity=SEVERITY_CRITICAL,
+                ))
+            except Exception as _ae:
+                _log.debug("[alerting] Alert fire failed: %s", _ae)
+
         if error and self._tracker and self._pending:
             try:
                 await self._tracker.push_dlq(self._pending, error)

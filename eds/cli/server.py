@@ -17,6 +17,7 @@ import aiohttp
 import click
 
 from eds.exit_codes import ExitCodes
+from eds.infrastructure.alerting import Alert, AlertManager, ChannelConfig, SEVERITY_CRITICAL
 from eds.infrastructure.config import EdsConfig, load_config, set_config_value
 from eds.infrastructure.consumer import Consumer, ConsumerConfig_
 from eds.infrastructure.metrics import start_metrics_server, health
@@ -90,6 +91,8 @@ async def _server(
     # ── One-time setup (shared across session renewals) ───────────────────────
     tracker = SqliteTracker(Path(data_dir) / "state.db")
     await tracker.open()
+
+    alerter: AlertManager | None = _build_alerter(cfg)
 
     start_metrics_server(host=cfg.metrics.host, port=cfg.metrics.port)
 
@@ -167,6 +170,7 @@ async def _server(
                 registry=registry,
                 export_table_timestamps=export_timestamps,
                 tracker=tracker,
+                alerter=alerter,
             )
             consumer = Consumer(consumer_cfg)
 
@@ -283,6 +287,18 @@ async def _server(
                 await consumer.disconnected.wait()
                 if not stop_event.is_set():
                     _log.error("NATS disconnected — exiting")
+                    if alerter:
+                        try:
+                            await alerter.fire(Alert(
+                                title="EDS NATS connection lost",
+                                body=(
+                                    f"The EDS server lost its NATS connection and is restarting "
+                                    f"the session (session={session_id})."
+                                ),
+                                severity=SEVERITY_CRITICAL,
+                            ))
+                        except Exception as exc:
+                            _log.debug("[alerting] Alert fire failed: %s", exc)
                     session_exit_code = ExitCodes.NATS_DISCONNECTED
                     stop_event.set()
 
@@ -338,6 +354,32 @@ async def _server(
 
     _log.info("EDS server stopped (exit code %d)", exit_code)
     sys.exit(exit_code)
+
+
+# ── Alert manager factory ─────────────────────────────────────────────────────
+
+def _build_alerter(cfg: EdsConfig) -> AlertManager | None:
+    """Build an AlertManager from config, or return None if no channels are configured."""
+    if not cfg.alerts.channels:
+        return None
+    channels = [
+        ChannelConfig(
+            type=ch.type,
+            severity=ch.severity,
+            url=ch.url,
+            headers=ch.headers,
+            routing_key=ch.routing_key,
+            host=ch.host,
+            port=ch.port,
+            username=ch.username,
+            password=ch.password,
+            from_addr=ch.from_addr,
+            to_addrs=ch.to_addrs,
+            use_tls=ch.use_tls,
+        )
+        for ch in cfg.alerts.channels
+    ]
+    return AlertManager(channels, cooldown_seconds=cfg.alerts.cooldown_seconds)
 
 
 # ── Driver-mode resolution ────────────────────────────────────────────────────
