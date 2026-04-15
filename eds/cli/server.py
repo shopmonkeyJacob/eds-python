@@ -7,6 +7,7 @@ import gzip
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import sys
@@ -295,10 +296,10 @@ async def _server(
                 return {"drivers": get_driver_metadata()}
 
             def _validate(scheme: str, values: dict[str, Any]) -> dict[str, Any]:
-                d = _registry.get(scheme)
-                if not d:
+                cls = _registry.get(scheme)
+                if not cls:
                     return {"success": False, "error": f"Unknown driver: {scheme}"}
-                result_url, errors = d.validate(values)
+                result_url, errors = cls().validate(values)
                 if errors:
                     return {"success": False, "errors": [{"field": e.field, "message": e.message} for e in errors]}
                 return {"success": True, "url": result_url}
@@ -489,6 +490,9 @@ async def _resolve_driver_mode(
     return flag_mode
 
 
+_SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z0-9_]{1,128}$')
+
+
 async def _resolve_events_schema(
     flag_value: str | None,
     cfg: EdsConfig,
@@ -497,6 +501,11 @@ async def _resolve_events_schema(
     """Resolve events schema: flag vs config, persist to config.toml if changed."""
     if flag_value is None:
         return cfg.events_schema or "eds_events"
+    if not _SAFE_IDENTIFIER_RE.match(flag_value):
+        raise click.UsageError(
+            f"Invalid --events-schema value {flag_value!r}. "
+            "Must contain only ASCII letters, digits, and underscores (1-128 chars)."
+        )
     if flag_value != cfg.events_schema:
         await set_config_value(data_dir, "events_schema", flag_value)
     return flag_value

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from typing import Any
 import asyncpg
 
@@ -18,6 +20,7 @@ class PostgresDriver(SqlDriverBase):
     def __init__(self) -> None:
         super().__init__()
         self._pool: asyncpg.Pool | None = None
+        self._tx_conn: asyncpg.Connection | None = None
 
     # ── Identity ───────────────────────────────────────────────────────────────
 
@@ -77,6 +80,17 @@ class PostgresDriver(SqlDriverBase):
         conn = await asyncpg.connect(url)
         await conn.close()
 
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                self._tx_conn = conn
+                try:
+                    yield
+                finally:
+                    self._tx_conn = None
+
     # ── Time-series dialect overrides ──────────────────────────────────────────
 
     def _build_create_or_replace_view_sql(self, qualified_view_name: str, select_sql: str) -> str:
@@ -103,8 +117,11 @@ class PostgresDriver(SqlDriverBase):
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
         )
         try:
-            async with self._pool.acquire() as conn:
-                await conn.execute(sql, *params)
+            if self._tx_conn:
+                await self._tx_conn.execute(sql, *params)
+            else:
+                async with self._pool.acquire() as conn:
+                    await conn.execute(sql, *params)
         except Exception:
             self._log_sql_error(sql, params)
             raise
@@ -135,8 +152,11 @@ class PostgresDriver(SqlDriverBase):
             f'ON CONFLICT (id) DO UPDATE SET {updates}'
         )
         try:
-            async with self._pool.acquire() as conn:
-                await conn.execute(sql, *values)
+            if self._tx_conn:
+                await self._tx_conn.execute(sql, *values)
+            else:
+                async with self._pool.acquire() as conn:
+                    await conn.execute(sql, *values)
         except Exception:
             self._log_sql_error(sql, values)
             raise
@@ -147,8 +167,11 @@ class PostgresDriver(SqlDriverBase):
         if not pk:
             return
         sql = f'DELETE FROM "{event.table}" WHERE id = $1'
-        async with self._pool.acquire() as conn:
-            await conn.execute(sql, pk)
+        if self._tx_conn:
+            await self._tx_conn.execute(sql, pk)
+        else:
+            async with self._pool.acquire() as conn:
+                await conn.execute(sql, pk)
 
     # ── Upsert schema migration ────────────────────────────────────────────────
 

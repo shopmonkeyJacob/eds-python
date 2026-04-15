@@ -29,7 +29,6 @@ class KafkaDriver(Driver):
     def __init__(self) -> None:
         self._producer: Producer | None = None
         self._topic: str = ""
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: list[DbChangeEvent] = []
 
     def name(self) -> str:
@@ -64,7 +63,6 @@ class KafkaDriver(Driver):
         return 1000
 
     async def start(self, config: DriverConfig) -> None:
-        self._loop = asyncio.get_event_loop()
         u = urlparse(config.url)
         broker = f"{u.hostname}:{u.port or 9092}"
         self._topic = u.path.lstrip("/")
@@ -105,9 +103,8 @@ class KafkaDriver(Driver):
 
         events = list(self._pending)
         self._pending = []
-        assert self._loop
         try:
-            await self._loop.run_in_executor(None, lambda: _produce(events))
+            await asyncio.get_running_loop().run_in_executor(None, lambda: _produce(events))
         except Exception:
             self._pending = events  # restore on error so caller can retry or NAK
             raise
@@ -159,7 +156,7 @@ def _build_import_event(row: dict[str, Any], table: str, raw_line: bytes) -> DbC
     company_id = row.get("companyId")
     location_id = row.get("locationId")
     # Mirrors Go: LocationId uses locationId but falls back to companyId when locationId is absent.
-    effective_location_id = company_id or location_id
+    effective_location_id = location_id or company_id
     return DbChangeEvent(
         operation="INSERT",
         id=record_id,

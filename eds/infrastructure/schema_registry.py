@@ -16,6 +16,7 @@ from typing import Any
 import aiohttp
 
 from eds.core.models import SchemaColumn, TableSchema
+from eds.core import retry
 from eds.core.tracker import Tracker
 
 _log = logging.getLogger(__name__)
@@ -124,25 +125,30 @@ class SchemaRegistry:
     # ── API fetch ─────────────────────────────────────────────────────────────
 
     async def _fetch_schema(self, table: str, model_version: str) -> TableSchema:
-        url = f"{self.api_url}/v3/schema/{table}/{model_version}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                data: dict[str, Any] = await resp.json()
+        async def _fetch() -> TableSchema:
+            url = f"{self.api_url}/v3/schema/{table}/{model_version}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    resp.raise_for_status()
+                    data: dict[str, Any] = await resp.json()
 
-        columns = [
-            SchemaColumn(
-                name=col["name"],
-                data_type=col.get("type", "text"),
-                nullable=col.get("nullable", True),
-                primary_key=col.get("primaryKey", False),
-            )
-            for col in data.get("columns", [])
-        ]
-        schema = TableSchema(table=table, model_version=model_version)
-        schema._columns = columns
-        return schema
+            columns = [
+                SchemaColumn(
+                    name=col["name"],
+                    data_type=col.get("type", "text"),
+                    nullable=col.get("nullable", True),
+                    primary_key=col.get("primaryKey", False),
+                )
+                for col in data.get("columns", [])
+            ]
+            schema = TableSchema(table=table, model_version=model_version)
+            schema._columns = columns
+            return schema
+
+        return await retry.execute(
+            _fetch, operation_name=f"fetch_schema/{table}/{model_version}"
+        )

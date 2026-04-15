@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -21,7 +23,6 @@ class SnowflakeDriver(SqlDriverBase):
     def __init__(self) -> None:
         super().__init__()
         self._conn: Any = None
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     def name(self) -> str:
         return "Snowflake"
@@ -62,7 +63,6 @@ class SnowflakeDriver(SqlDriverBase):
         return f"snowflake://{auth}{account}/{db}/{schema}?warehouse={wh}{extra}", []
 
     async def _connect(self, url: str) -> None:
-        self._loop = asyncio.get_event_loop()
         u = urlparse(url)
         qs = parse_qs(u.query)
         parts = u.path.lstrip("/").split("/")
@@ -80,22 +80,44 @@ class SnowflakeDriver(SqlDriverBase):
                 role=(qs.get("role") or [""])[0] or None,
             )
 
-        self._conn = await self._loop.run_in_executor(None, _open)
+        self._conn = await asyncio.get_running_loop().run_in_executor(None, _open)
 
     async def _close(self) -> None:
         if self._conn:
             conn = self._conn
             self._conn = None
-            assert self._loop
-            await self._loop.run_in_executor(None, conn.close)
+            await asyncio.get_running_loop().run_in_executor(None, conn.close)
 
     async def test(self, url: str) -> None:
         await self._connect(url)
         await self._close()
 
     async def _run(self, fn: Any) -> Any:
-        assert self._loop
-        return await self._loop.run_in_executor(None, fn)
+        return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        assert self._conn
+
+        def _begin() -> None:
+            assert self._conn
+            self._conn.cursor().execute("BEGIN")
+
+        def _commit() -> None:
+            assert self._conn
+            self._conn.cursor().execute("COMMIT")
+
+        def _rollback() -> None:
+            assert self._conn
+            self._conn.cursor().execute("ROLLBACK")
+
+        await self._run(_begin)
+        try:
+            yield
+            await self._run(_commit)
+        except Exception:
+            await self._run(_rollback)
+            raise
 
     # ── Time-series dialect overrides ──────────────────────────────────────────
 

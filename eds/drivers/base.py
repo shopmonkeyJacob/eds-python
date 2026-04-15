@@ -10,10 +10,12 @@ Provides:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
 from abc import abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
 from eds.core.driver import Driver, DriverConfig, DriverMode
@@ -76,6 +78,16 @@ class SqlDriverBase(Driver):
     async def _execute_insert_event(self, event: DbChangeEvent) -> None:
         """Execute a time-series INSERT into the events table (parameterised)."""
 
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        """Async context manager wrapping a database transaction.
+
+        Derived classes override this to acquire a connection, start a
+        transaction, and commit/rollback as appropriate.  The default
+        implementation is a no-op pass-through (no transactional guarantee).
+        """
+        yield
+
     async def start(self, config: DriverConfig) -> None:
         self._config = config
         self._log = config.logger
@@ -99,18 +111,20 @@ class SqlDriverBase(Driver):
     async def flush(self) -> None:
         if not self._pending:
             return
-        for evt in self._pending:
-            _assert_safe_identifier(evt.table)
-            # Imported events (bulk import snapshot) always go to the standard mirror
-            # table via upsert, regardless of driver mode. Time-series events tables
-            # are populated by the live CDC stream once the server starts.
-            if self._mode == DriverMode.TIMESERIES and not evt.imported:
-                await self._execute_insert_event(evt)
-            elif evt.operation == "DELETE":
-                await self._execute_delete(evt)
-            else:
-                await self._execute_upsert(evt)
+        batch = self._pending
         self._pending = []
+        try:
+            async with self._transaction():
+                for evt in batch:
+                    _assert_safe_identifier(evt.table)
+                    if self._mode == DriverMode.TIMESERIES and not evt.imported:
+                        await self._execute_insert_event(evt)
+                    elif evt.operation == "DELETE":
+                        await self._execute_delete(evt)
+                    else:
+                        await self._execute_upsert(evt)
+        except Exception:
+            raise
 
     async def test(self, url: str) -> None:
         await self._connect(url)

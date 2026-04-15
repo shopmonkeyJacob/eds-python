@@ -195,44 +195,48 @@ class NullDriver(Driver):
 # Driver registry
 # ---------------------------------------------------------------------------
 
-_registry: dict[str, Driver] = {}
+_registry: dict[str, type[Driver]] = {}
 _alias_registry: dict[str, str] = {}  # alias scheme → canonical scheme
 
 
-def register_driver(scheme: str, driver: Driver) -> None:
-    _registry[scheme] = driver
-    for alias in driver.aliases():
+def register_driver(scheme: str, driver: Driver | type[Driver]) -> None:
+    cls = driver if isinstance(driver, type) else type(driver)
+    _registry[scheme] = cls
+    instance = driver if not isinstance(driver, type) else cls()
+    for alias in instance.aliases():
         _alias_registry[alias] = scheme
 
 
-def _resolve(scheme: str) -> Driver | None:
-    d = _registry.get(scheme)
-    if d:
-        return d
+def _resolve(scheme: str) -> type[Driver] | None:
+    cls = _registry.get(scheme)
+    if cls:
+        return cls
     canonical = _alias_registry.get(scheme)
     return _registry.get(canonical) if canonical else None
 
 
 async def new_driver(url: str, config: DriverConfig) -> Driver:
     scheme = urlparse(url).scheme
-    driver = _resolve(scheme)
-    if driver is None:
+    cls = _resolve(scheme)
+    if cls is None:
         raise ValueError(f"No driver registered for scheme '{scheme}'")
+    driver = cls()
     await driver.start(config)
     return driver
 
 
 def get_driver_metadata() -> list[dict[str, Any]]:
     result = []
-    for scheme, driver in _registry.items():
+    for scheme, cls in _registry.items():
+        instance = cls()
         result.append(
             {
                 "scheme": scheme,
-                "name": driver.name(),
-                "description": driver.description(),
-                "example_url": driver.example_url(),
-                "help": driver.help_text(),
-                "supports_migration": driver.supports_migration(),
+                "name": instance.name(),
+                "description": instance.description(),
+                "example_url": instance.example_url(),
+                "help": instance.help_text(),
+                "supports_migration": instance.supports_migration(),
             }
         )
     return result

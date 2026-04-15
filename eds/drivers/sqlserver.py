@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -25,7 +27,6 @@ class SqlServerDriver(SqlDriverBase):
     def __init__(self) -> None:
         super().__init__()
         self._conn: pyodbc.Connection | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     def name(self) -> str:
         return "SQL Server"
@@ -86,9 +87,8 @@ class SqlServerDriver(SqlDriverBase):
         if pyodbc is None:
             raise ImportError("pyodbc is required for the SQL Server driver. "
                               "Install unixODBC then: pip install pyodbc")
-        self._loop = asyncio.get_event_loop()
         conn_str = self._build_conn_str(url)
-        self._conn = await self._loop.run_in_executor(
+        self._conn = await asyncio.get_running_loop().run_in_executor(
             None, lambda: pyodbc.connect(conn_str, autocommit=True)
         )
 
@@ -96,16 +96,32 @@ class SqlServerDriver(SqlDriverBase):
         if self._conn:
             conn = self._conn
             self._conn = None
-            assert self._loop
-            await self._loop.run_in_executor(None, conn.close)
+            await asyncio.get_running_loop().run_in_executor(None, conn.close)
 
     async def test(self, url: str) -> None:
         await self._connect(url)
         await self._close()
 
     async def _run(self, fn: Any) -> Any:
-        assert self._loop
-        return await self._loop.run_in_executor(None, fn)
+        return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        assert self._conn
+
+        def _set_autocommit(val: bool) -> None:
+            assert self._conn
+            self._conn.autocommit = val
+
+        await self._run(lambda: _set_autocommit(False))
+        try:
+            yield
+            await self._run(lambda: self._conn.commit())  # type: ignore[union-attr]
+        except Exception:
+            await self._run(lambda: self._conn.rollback())  # type: ignore[union-attr]
+            raise
+        finally:
+            await self._run(lambda: _set_autocommit(True))
 
     # ── Time-series dialect overrides ──────────────────────────────────────────
 

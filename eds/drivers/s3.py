@@ -29,7 +29,6 @@ class S3Driver(Driver):
         self._client: Any = None
         self._bucket: str = ""
         self._prefix: str = ""
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: list[DbChangeEvent] = []
 
     def name(self) -> str:
@@ -66,7 +65,6 @@ class S3Driver(Driver):
         return 500
 
     async def start(self, config: DriverConfig) -> None:
-        self._loop = asyncio.get_event_loop()
         u = urlparse(config.url)
         qs = parse_qs(u.query)
         self._bucket = u.hostname or ""
@@ -105,13 +103,11 @@ class S3Driver(Driver):
 
         events = list(self._pending)
         self._pending = []
-        assert self._loop
-        await self._loop.run_in_executor(None, lambda: _upload(events))
+        await asyncio.get_running_loop().run_in_executor(None, lambda: _upload(events))
 
     async def test(self, url: str) -> None:
         await self.start(DriverConfig(url=url, logger=logging.getLogger(__name__), data_dir=""))
-        assert self._loop
-        await self._loop.run_in_executor(None, lambda: self._client.head_bucket(Bucket=self._bucket))
+        await asyncio.get_running_loop().run_in_executor(None, lambda: self._client.head_bucket(Bucket=self._bucket))
 
     # ── Direct import ──────────────────────────────────────────────────────────
 
@@ -138,8 +134,7 @@ class S3Driver(Driver):
                     )
 
             async with sem:
-                assert self._loop
-                await self._loop.run_in_executor(None, _put)
+                await asyncio.get_running_loop().run_in_executor(None, _put)
 
         await asyncio.gather(*(_upload_one(t, p) for t, p in file_table_pairs))
         logging.getLogger(__name__).info(

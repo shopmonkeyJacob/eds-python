@@ -163,7 +163,7 @@ def _build_import_event(row: dict[str, Any], table: str, raw_line: bytes) -> DbC
     company_id = row.get("companyId")
     location_id = row.get("locationId")
     # Mirrors Go: LocationId uses locationId but falls back to companyId when locationId is absent.
-    effective_location_id = company_id or location_id
+    effective_location_id = location_id or company_id
     return DbChangeEvent(
         operation="INSERT",
         id=record_id,

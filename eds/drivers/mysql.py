@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,6 +22,8 @@ class MySQLDriver(SqlDriverBase):
     def __init__(self) -> None:
         super().__init__()
         self._pool: aiomysql.Pool | None = None
+        self._tx_conn: Any = None
+        self._tx_cur: Any = None
 
     def name(self) -> str:
         return "MySQL"
@@ -79,6 +83,25 @@ class MySQLDriver(SqlDriverBase):
         await self._connect(url)
         await self._close()
 
+    @contextlib.asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        assert self._pool
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            cur = await conn.cursor()
+            self._tx_conn = conn
+            self._tx_cur = cur
+            try:
+                yield
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            finally:
+                await cur.close()
+                self._tx_conn = None
+                self._tx_cur = None
+
     # ── Time-series dialect overrides ──────────────────────────────────────────
 
     def _ensure_events_schema_sql(self, schema_name: str) -> str:
@@ -123,9 +146,12 @@ class MySQLDriver(SqlDriverBase):
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         )
         try:
-            async with self._pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(sql, params)
+            if self._tx_cur:
+                await self._tx_cur.execute(sql, params)
+            else:
+                async with self._pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(sql, params)
         except Exception:
             self._log_sql_error(sql, params)
             raise
@@ -153,9 +179,12 @@ class MySQLDriver(SqlDriverBase):
             f"ON DUPLICATE KEY UPDATE {updates}"
         )
         try:
-            async with self._pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(sql, values)
+            if self._tx_cur:
+                await self._tx_cur.execute(sql, values)
+            else:
+                async with self._pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(sql, values)
         except Exception:
             self._log_sql_error(sql, values)
             raise
@@ -166,9 +195,12 @@ class MySQLDriver(SqlDriverBase):
         if not pk:
             return
         sql = f"DELETE FROM `{event.table}` WHERE id = %s"
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, (pk,))
+        if self._tx_cur:
+            await self._tx_cur.execute(sql, (pk,))
+        else:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, (pk,))
 
     # ── Upsert schema migration ────────────────────────────────────────────────
 

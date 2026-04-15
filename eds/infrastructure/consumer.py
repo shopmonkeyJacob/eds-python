@@ -259,10 +259,10 @@ class Consumer:
                     payload = json.loads(data)
                 evt = DbChangeEvent.from_dict(payload)
             except Exception as exc:
-                _log.error("Failed to decode message: %s", exc)
-                await self._nack_everything(error=f"Decode error: {exc}")
-                self._disconnected.set()
-                return
+                _log.error("Failed to decode message, discarding: %s", exc)
+                await msg.ack()
+                metrics.pending_events.dec()
+                continue
 
             # MVCC timestamp filtering — skip events from before the import cutoff
             if cfg.export_table_timestamps:
@@ -344,7 +344,7 @@ class Consumer:
             except Exception as exc:
                 last_exc = exc
                 if attempt < MAX_FLUSH_RETRIES:
-                    delay = _FLUSH_RETRY_DELAYS[attempt - 1]
+                    delay = _FLUSH_RETRY_DELAYS[min(attempt - 1, len(_FLUSH_RETRY_DELAYS) - 1)]
                     _log.warning(
                         "[consumer] Flush attempt %d/%d failed — retrying in %.0fs: %s",
                         attempt, MAX_FLUSH_RETRIES, delay, exc,
