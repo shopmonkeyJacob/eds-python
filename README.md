@@ -9,7 +9,7 @@ A Python port of Shopmonkey's Enterprise Data Streaming server. Connects to Shop
 | `postgres`   | PostgreSQL / CockroachDB | ✓      | ✓           | ✓       | ✓           | ✓        |
 | `mysql`      | MySQL / MariaDB          | ✓      | ✓           | ✓       | ✓           | ✓        |
 | `sqlserver`  | SQL Server               | ✓      | ✓           | ✓       | ✓           | ✓        |
-| `snowflake`  | Snowflake                | ✓      | —           | ✓       | —           | —        |
+| `snowflake`  | Snowflake                | ✓      | ✓           | ✓       | —           | —        |
 | `s3`         | Amazon S3                | ✓ ²    | —           | —       | —           | —        |
 | `azureblob`  | Azure Blob Storage       | ✓ ²    | —           | —       | —           | —        |
 | `file`       | Local NDJSON files       | ✓ ²    | —           | —       | —           | —        |
