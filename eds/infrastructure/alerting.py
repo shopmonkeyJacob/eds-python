@@ -81,7 +81,7 @@ class AlertManager:
             if alert.severity not in ch.severity:
                 continue
             key = (idx, alert.title)
-            last = self._last_fired.get(key, 0.0)
+            last = self._last_fired.get(key, float("-inf"))
             if now - last < self._cooldown:
                 _log.debug("[alerting] Suppressing '%s' on channel %d (cooldown).", alert.title, idx)
                 continue

@@ -106,6 +106,7 @@ pip install ".[dev]"
 | `--url`           | Driver connection URL (or set `EDS_URL` env var)                               |
 | `--driver-mode`   | `upsert` (default) or `timeseries` — see [Time-Series Mode](#time-series-mode) |
 | `--events-schema` | Schema name for time-series events tables (default: `eds_events`)              |
+| `--dry-run`       | Receive and decode events without writing to any destination. Useful for verifying NATS connectivity and schema decoding before configuring a driver. |
 
 ### `eds import` options
 

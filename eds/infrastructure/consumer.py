@@ -228,9 +228,12 @@ class Consumer:
             try:
                 msg = self._buffer.get_nowait()
             except asyncio.QueueEmpty:
-                # Min-latency flush
+                # Flush 3: opportunistic flush when buffer is temporarily empty and
+                # min latency has elapsed. Guard count < max_batch mirrors Go: if the
+                # batch is already at the ceiling, Flush 2 should have caught it.
+                count = len(self._pending)
                 if (
-                    self._pending
+                    0 < count < max_batch
                     and self._pending_started is not None
                     and time.monotonic() - self._pending_started >= cfg.min_pending_latency
                 ):
@@ -285,15 +288,40 @@ class Consumer:
             driver_max = driver.max_batch_size()
             effective_max = driver_max if driver_max > 0 else max_batch
 
-            should_flush = (
-                force_flush
-                or len(self._pending) >= effective_max
+            # Flush 1: driver-forced, migration, or driver batch size threshold.
+            # Uses the driver's own limit (falling back to MaxAckPending for
+            # unlimited drivers), mirroring Go's maxsize logic.
+            if force_flush or len(self._pending) >= effective_max:
+                await self._flush()
+                continue
+
+            # Catch-up skip: if the stream has significantly more messages still
+            # pending delivery than our max batch, skip time-based flushing and
+            # keep accumulating to maximise throughput during catch-up. The 2×
+            # maxPendingLatency ceiling prevents infinite accumulation.
+            num_pending: int = 0
+            try:
+                meta = msg.metadata
+                if meta is not None:
+                    num_pending = meta.num_pending or 0
+            except Exception:
+                pass
+            if (
+                num_pending > max_batch
+                and self._pending_started is not None
+                and time.monotonic() - self._pending_started < cfg.max_pending_latency * 2
+            ):
+                continue  # catch-up mode: keep accumulating
+
+            # Flush 2: count has reached the MaxAckPending ceiling, or the max
+            # latency window has elapsed — whichever comes first.
+            if (
+                len(self._pending) >= max_batch
                 or (
                     self._pending_started is not None
                     and time.monotonic() - self._pending_started >= cfg.max_pending_latency
                 )
-            )
-            if should_flush:
+            ):
                 await self._flush()
 
     async def _flush(self) -> None:
