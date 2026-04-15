@@ -113,11 +113,17 @@ class Consumer:
                 metrics.health.set_nats_connected(False)
                 self._disconnected.set()
 
+        def _on_reconnect(nc: NatsClient) -> None:
+            if not self._stopping:
+                _log.info("NATS connection re-established")
+                metrics.health.set_nats_connected(True)
+
         self._nc = await nats.connect(
             cfg.nats_url,
             user_credentials=cfg.credentials_file or None,
             closed_cb=_on_closed,
             disconnected_cb=_on_disconnect,
+            reconnected_cb=_on_reconnect,
             name=f"eds-{cfg.server_id}",
         )
         metrics.health.set_nats_connected(True)
