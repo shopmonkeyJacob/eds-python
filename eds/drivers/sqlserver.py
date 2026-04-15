@@ -194,7 +194,11 @@ class SqlServerDriver(SqlDriverBase):
             assert self._conn
             self._conn.execute(sql, params)
 
-        await self._run(_exec)
+        try:
+            await self._run(_exec)
+        except Exception:
+            self._log_sql_error(sql, params)
+            raise
 
     # ── Upsert schema migration ────────────────────────────────────────────────
 
@@ -298,7 +302,11 @@ class SqlServerDriver(SqlDriverBase):
             assert self._conn
             self._conn.execute(sql, values)
 
-        await self._run(_exec)
+        try:
+            await self._run(_exec)
+        except Exception:
+            self._log_sql_error(sql, values)
+            raise
 
     async def _execute_delete(self, event: DbChangeEvent) -> None:
         assert self._conn

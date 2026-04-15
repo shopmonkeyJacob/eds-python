@@ -165,7 +165,11 @@ class SnowflakeDriver(SqlDriverBase):
             finally:
                 cur.close()
 
-        await self._run(_exec)
+        try:
+            await self._run(_exec)
+        except Exception:
+            self._log_sql_error(sql, params)
+            raise
 
     async def _execute_upsert(self, event: DbChangeEvent) -> None:
         assert self._conn
@@ -202,7 +206,11 @@ class SnowflakeDriver(SqlDriverBase):
             finally:
                 cur.close()
 
-        await self._run(_exec)
+        try:
+            await self._run(_exec)
+        except Exception:
+            self._log_sql_error(sql, values)
+            raise
 
     async def _execute_delete(self, event: DbChangeEvent) -> None:
         assert self._conn

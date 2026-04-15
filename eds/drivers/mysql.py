@@ -122,9 +122,13 @@ class MySQLDriver(SqlDriverBase):
             "_company_id, _location_id, _model_ver, _diff, _before, _after) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         )
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, params)
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, params)
+        except Exception:
+            self._log_sql_error(sql, params)
+            raise
 
     # ── Upsert DML ────────────────────────────────────────────────────────────
 
@@ -148,9 +152,13 @@ class MySQLDriver(SqlDriverBase):
             f"INSERT INTO `{event.table}` ({col_list}) VALUES ({placeholders}) "
             f"ON DUPLICATE KEY UPDATE {updates}"
         )
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(sql, values)
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, values)
+        except Exception:
+            self._log_sql_error(sql, values)
+            raise
 
     async def _execute_delete(self, event: DbChangeEvent) -> None:
         assert self._pool

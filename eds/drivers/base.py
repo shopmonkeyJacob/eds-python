@@ -366,8 +366,8 @@ class SqlDriverBase(Driver):
         """
         qt = self._qualify_events_table(evt.table)
         diff_json = json.dumps(evt.diff) if evt.diff else None
-        before_str = evt.before.decode() if evt.before else None
-        after_str = evt.after.decode() if evt.after else None
+        before_str = self._normalize_json(evt.before)
+        after_str = self._normalize_json(evt.after)
         params: list[Any] = [
             evt.id,
             evt.operation,
@@ -384,6 +384,49 @@ class SqlDriverBase(Driver):
         return qt, params
 
     # ── SQL helpers ────────────────────────────────────────────────────────────
+
+    def _log_sql_error(self, sql: str, params: Any = None) -> None:
+        """Log a failing SQL statement at two verbosity levels.
+
+        Logs a truncated version at ERROR (visible on the console in normal mode)
+        and the full SQL plus params at DEBUG (captured by the file sink only,
+        since the file sink uses Debug minimum level while the console uses
+        Information in normal mode).
+        """
+        short_sql = sql[:500] + "…" if len(sql) > 500 else sql
+        self._log.error("[%s] SQL execution failed. SQL: %s", self.__class__.__name__, short_sql)
+        params_repr = repr(params) if params is not None else ""
+        self._log.debug(
+            "[%s] Full SQL: %s%s",
+            self.__class__.__name__,
+            sql,
+            f" | params={params_repr}" if params_repr else "",
+        )
+
+    def _normalize_json(self, raw: bytes | None) -> str | None:
+        """Re-serialize raw JSON bytes through the standard parser so that all
+        control characters and non-ASCII codepoints are properly escaped before
+        insertion into a JSON-typed column (MySQL/PostgreSQL).
+
+        Raw payloads sourced from CDC may contain unescaped control characters
+        inside JSON string values that are valid per msgpack but rejected by
+        strict JSON column validators (MySQL: 'Invalid encoding in string').
+        Re-serializing via json.loads + json.dumps normalizes them to \\uXXXX.
+        """
+        if not raw:
+            return None
+        try:
+            return json.dumps(json.loads(raw))
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+            # Invalid UTF-8 bytes — replace them and try again.
+            try:
+                sanitized = raw.decode('utf-8', errors='replace')
+                return json.dumps(json.loads(sanitized))
+            except Exception:
+                self._log.warning(
+                    "Dropping unrecoverable JSON payload (%d bytes) — storing NULL", len(raw)
+                )
+                return None
 
     @staticmethod
     def _flatten_object(event: DbChangeEvent) -> dict[str, Any]:

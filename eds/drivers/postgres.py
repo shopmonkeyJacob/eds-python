@@ -102,8 +102,12 @@ class PostgresDriver(SqlDriverBase):
             "_company_id, _location_id, _model_ver, _diff, _before, _after) "
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
         )
-        async with self._pool.acquire() as conn:
-            await conn.execute(sql, *params)
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(sql, *params)
+        except Exception:
+            self._log_sql_error(sql, params)
+            raise
 
     # ── Upsert DML ────────────────────────────────────────────────────────────
 
@@ -130,8 +134,12 @@ class PostgresDriver(SqlDriverBase):
             f'INSERT INTO "{event.table}" ({col_list}) VALUES ({placeholders}) '
             f'ON CONFLICT (id) DO UPDATE SET {updates}'
         )
-        async with self._pool.acquire() as conn:
-            await conn.execute(sql, *values)
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(sql, *values)
+        except Exception:
+            self._log_sql_error(sql, values)
+            raise
 
     async def _execute_delete(self, event: DbChangeEvent) -> None:
         assert self._pool
