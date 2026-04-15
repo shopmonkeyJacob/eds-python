@@ -28,9 +28,10 @@ def list_drivers() -> None:
 @click.argument("scheme")
 def driver_help(scheme: str) -> None:
     """Show connection string help for a specific driver scheme."""
-    d = _registry.get(scheme)
-    if d is None:
+    cls = _registry.get(scheme)
+    if cls is None:
         raise click.ClickException(f"No driver registered for scheme '{scheme}'")
+    d = cls()
 
     click.echo(f"\n{d.name()}")
     click.echo("=" * len(d.name()))

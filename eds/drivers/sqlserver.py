@@ -116,9 +116,9 @@ class SqlServerDriver(SqlDriverBase):
         await self._run(lambda: _set_autocommit(False))
         try:
             yield
-            await self._run(lambda: self._conn.commit())  # type: ignore[union-attr]
+            await self._run(lambda: self._conn.commit())
         except Exception:
-            await self._run(lambda: self._conn.rollback())  # type: ignore[union-attr]
+            await self._run(lambda: self._conn.rollback())
             raise
         finally:
             await self._run(lambda: _set_autocommit(True))

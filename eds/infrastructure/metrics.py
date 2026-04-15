@@ -137,7 +137,7 @@ class HealthState:
     def readiness(self) -> tuple[int, dict[str, object]]:
         """200 when NATS is connected and the consumer is active."""
         with self._lock:
-            connected = self._nats_connected
+            connected = self._nats_connected  
             running = self._consumer_running
             paused = self._paused
         ok = connected and running
