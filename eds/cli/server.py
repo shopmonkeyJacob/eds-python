@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import logging
 import os
+import random
 import shutil
 import signal
 import sys
@@ -34,6 +35,13 @@ _log = logging.getLogger(__name__)
 
 _DEFAULT_API_URL = "https://api.shopmonkey.cloud"
 _RENEW_INTERVAL = 60 * 60 * 24  # 24 hours
+
+# Startup retry parameters (mirrors Go's util.NewHTTPRetry / maxFailures=5)
+_MAX_STARTUP_FAILURES   = 5
+_STARTUP_RETRY_BASE_S   = 0.1   # 100 ms base delay
+_STARTUP_RETRY_JITTER_S = 0.5   # up to 500 ms × attempt number
+_ALREADY_RUNNING_DELAY_S = 5.0  # wait when HQ reports session already running
+_NATS_RETRY_DELAY_S      = 5.0  # fixed delay between NATS connection retries
 
 
 @click.command()
@@ -321,8 +329,26 @@ async def _server(
                 await global_stop.wait()
                 stop_event.set()
 
-            # Start session services
-            await consumer.start()
+            # Start session services — retry NATS connection on transient failures
+            nats_failures = 0
+            while True:
+                try:
+                    await consumer.start()
+                    break
+                except Exception as exc:
+                    nats_failures += 1
+                    if nats_failures >= _MAX_STARTUP_FAILURES:
+                        _log.error(
+                            "[server] NATS consumer start failed after %d attempts: %s",
+                            nats_failures, exc,
+                        )
+                        raise
+                    _log.warning(
+                        "[server] NATS consumer start failed (attempt %d/%d): %s — retrying in %ds",
+                        nats_failures, _MAX_STARTUP_FAILURES, exc, int(_NATS_RETRY_DELAY_S),
+                    )
+                    await asyncio.sleep(_NATS_RETRY_DELAY_S)
+
             health.set_info(CURRENT, session_id, url)
             health.set_consumer_running(True)
             await notify_svc.start()
@@ -454,7 +480,13 @@ async def _start_session(
     server_id: str,
     data_dir: str,
 ) -> dict[str, Any]:
-    """Start a new EDS session with Shopmonkey HQ and write the NATS credentials."""
+    """Start a new EDS session with Shopmonkey HQ and write the NATS credentials.
+
+    Retries up to _MAX_STARTUP_FAILURES times on transient network/HTTP errors
+    using exponential jitter (100 ms base + up to 500 ms × attempt).  A 409
+    "already running" response waits _ALREADY_RUNNING_DELAY_S seconds and retries
+    without consuming a failure slot.
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "User-Agent": f"Shopmonkey EDS Server/{CURRENT}",
@@ -464,17 +496,47 @@ async def _start_session(
         "version": CURRENT,
         "os": sys.platform,
     }
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.post(
-            f"{api_url}/v3/eds/internal",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            if not data.get("success"):
-                raise click.ClickException(f"Session start failed: {data.get('message', 'unknown')}")
-            d = data["data"]
+    failures = 0
+    d: dict[str, Any]
+    while True:
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.post(
+                    f"{api_url}/v3/eds/internal",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 409:
+                        _log.warning(
+                            "[server] Session already running — waiting %ds before retry...",
+                            int(_ALREADY_RUNNING_DELAY_S),
+                        )
+                        await asyncio.sleep(_ALREADY_RUNNING_DELAY_S)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    if not data.get("success"):
+                        raise click.ClickException(
+                            f"Session start failed: {data.get('message', 'unknown')}"
+                        )
+                    d = data["data"]
+        except click.ClickException:
+            raise
+        except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            failures += 1
+            if failures >= _MAX_STARTUP_FAILURES:
+                _log.error(
+                    "[server] Session start failed after %d attempts: %s", failures, exc
+                )
+                raise
+            delay = _STARTUP_RETRY_BASE_S + random.uniform(0, _STARTUP_RETRY_JITTER_S * failures)
+            _log.warning(
+                "[server] Session start failed (attempt %d/%d): %s — retrying in %.2fs",
+                failures, _MAX_STARTUP_FAILURES, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        break
 
     session_id = d["sessionId"]
     creds_b64: str = d.get("credentials", "")
