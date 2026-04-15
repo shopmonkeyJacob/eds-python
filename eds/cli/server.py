@@ -20,7 +20,7 @@ import click
 from eds.exit_codes import ExitCodes
 from eds.infrastructure.alerting import Alert, AlertManager, ChannelConfig, SEVERITY_CRITICAL
 from eds.infrastructure.config import EdsConfig, load_config, set_config_value
-from eds.infrastructure.consumer import Consumer, ConsumerConfig_
+from eds.infrastructure.consumer import Consumer, ConsumerConfig_, DEFAULT_MIN_PENDING_LATENCY, DEFAULT_MAX_PENDING_LATENCY, DEFAULT_MAX_ACK_PENDING
 from eds.infrastructure.metrics import start_metrics_server, health
 from eds.infrastructure.notification import NotificationHandlers, NotificationService
 from eds.infrastructure.tracker import SqliteTracker
@@ -50,7 +50,7 @@ _NATS_RETRY_DELAY_S      = 5.0  # fixed delay between NATS connection retries
 @click.option("--url", envvar="EDS_URL", default="", help="Driver connection URL.")
 @click.option("--driver-mode", "driver_mode", default=None,
               type=click.Choice(["upsert", "timeseries"], case_sensitive=False),
-              help="Event writing mode: upsert (default) or timeseries.")
+              help="Event writing mode: timeseries (default) or upsert.")
 @click.option("--events-schema", "events_schema", default=None,
               help="Schema name for time-series events tables (default: eds_events).")
 @click.option("--renew-interval", default=_RENEW_INTERVAL, hidden=True,
@@ -102,9 +102,36 @@ async def _server(
             "but NOT written to any destination."
         )
 
-    # Resolve driver mode (flag vs config, persist if changed, prompt on conflict)
-    mode = await _resolve_driver_mode(driver_mode_flag, cfg, data_dir)
-    events_schema = await _resolve_events_schema(events_schema_flag, cfg, data_dir)
+    # ── Post-enrollment configuration wizard ────────────────────────────────
+    # A fresh enrollment leaves config.toml with just token + server_id.
+    # If driver_mode is not yet set (and no --driver-mode flag was passed),
+    # the user hasn't been through the wizard yet — run it now.
+    just_enrolled = not cfg.driver_mode and driver_mode_flag is None
+    if just_enrolled:
+        from eds.cli.config_wizard import run_wizard
+        wizard_result = await run_wizard(data_dir)
+        mode = wizard_result.mode
+        events_schema = wizard_result.events_schema
+        # Reload config so the consumer picks up the wizard-written values
+        cfg = load_config(data_dir)
+    else:
+        # Resolve driver mode (flag vs config, persist if changed, prompt on conflict)
+        mode = await _resolve_driver_mode(driver_mode_flag, cfg, data_dir)
+        events_schema = await _resolve_events_schema(events_schema_flag, cfg, data_dir)
+
+    # Read flush tuning from config (0 = use consumer defaults)
+    min_pending_latency = (
+        float(cfg.min_pending_latency) if cfg.min_pending_latency > 0
+        else DEFAULT_MIN_PENDING_LATENCY
+    )
+    max_pending_latency = (
+        float(cfg.max_pending_latency) if cfg.max_pending_latency > 0
+        else DEFAULT_MAX_PENDING_LATENCY
+    )
+    max_ack_pending = (
+        cfg.max_ack_pending if cfg.max_ack_pending > 0
+        else DEFAULT_MAX_ACK_PENDING
+    )
 
     # ── One-time setup (shared across session renewals) ───────────────────────
     tracker = SqliteTracker(Path(data_dir) / "state.db")
@@ -192,6 +219,9 @@ async def _server(
                 export_table_timestamps=export_timestamps,
                 tracker=tracker,
                 alerter=alerter,
+                min_pending_latency=min_pending_latency,
+                max_pending_latency=max_pending_latency,
+                max_ack_pending=max_ack_pending,
             )
             consumer = Consumer(consumer_cfg)
 
@@ -434,7 +464,7 @@ async def _resolve_driver_mode(
     """Resolve driver mode: flag vs config, persist to config.toml if changed,
     prompt interactively on conflict."""
     if flag_value is None:
-        return DriverMode(cfg.driver_mode) if cfg.driver_mode else DriverMode.UPSERT
+        return DriverMode(cfg.driver_mode) if cfg.driver_mode else DriverMode.TIMESERIES
 
     flag_mode = DriverMode(flag_value.lower())
     stored = cfg.driver_mode

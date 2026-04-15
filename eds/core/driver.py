@@ -55,7 +55,7 @@ class DriverConfig:
     data_dir: str
     tracker: SqliteTracker | None = None
     schema_registry: SchemaRegistry | None = None
-    mode: DriverMode = DriverMode.UPSERT
+    mode: DriverMode = DriverMode.TIMESERIES
     events_schema: str = "eds_events"
 
 

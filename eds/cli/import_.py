@@ -49,7 +49,7 @@ _log = logging.getLogger(__name__)
               help="Resume the last interrupted import (implies --no-delete --no-cleanup).")
 @click.option("--driver-mode", "driver_mode", default=None,
               type=click.Choice(["upsert", "timeseries"], case_sensitive=False),
-              help="Event writing mode: upsert (default) or timeseries.")
+              help="Event writing mode: timeseries (default) or upsert.")
 @click.option("--events-schema", "events_schema", default=None,
               help="Schema name for time-series events tables (default: eds_events).")
 @click.pass_context

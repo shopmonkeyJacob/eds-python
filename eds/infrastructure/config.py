@@ -61,6 +61,11 @@ class EdsConfig:
     driver_mode: str = ""        # "upsert" | "timeseries" — empty means use default
     events_schema: str = ""      # events schema name — empty means use default
 
+    # Flush tuning (written by the config wizard, read by the consumer)
+    min_pending_latency: int = 0   # seconds; 0 = use consumer default
+    max_pending_latency: int = 0   # seconds; 0 = use consumer default
+    max_ack_pending: int = 0       # 0 = use consumer default
+
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
     # Runtime — not persisted
@@ -89,6 +94,9 @@ def load_config(data_dir: str) -> EdsConfig:
                 "Must contain only ASCII letters, digits, and underscores (1–128 chars)."
             )
         cfg.events_schema = raw_schema
+        cfg.min_pending_latency = int(raw.get("min_pending_latency", 0))
+        cfg.max_pending_latency = int(raw.get("max_pending_latency", 0))
+        cfg.max_ack_pending = int(raw.get("max_ack_pending", 0))
         if "metrics" in raw:
             m = raw["metrics"]
             cfg.metrics.port = int(m.get("port", 8080))
